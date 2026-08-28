@@ -17,6 +17,7 @@ class InputInjector(private val service: AccessibilityService) {
     companion object {
         private const val TAG = "InputInjector"
         private const val DEFAULT_TAP_DURATION_MS = 50L
+        private const val FAST_TAP_DURATION_MS = 20L
         private const val DEFAULT_SWIPE_DURATION_MS = 260L
         private const val DEFAULT_MIN_TAP_INTERVAL_MS = 70L
         private const val DEFAULT_MIN_SWIPE_INTERVAL_MS = 120L
@@ -68,7 +69,17 @@ class InputInjector(private val service: AccessibilityService) {
         }
     }
 
-    fun performTap(x: Int, y: Int): Boolean {
+    fun performTap(x: Int, y: Int): Boolean =
+        performTapInternal(x, y, tapDurationMs)
+
+    /**
+     * Vision mode already waits for a fresh screenshot before every shot, so a long press duration
+     * adds latency without adding safety. Keep the Android gesture valid but as short as practical.
+     */
+    fun performFastTap(x: Int, y: Int): Boolean =
+        performTapInternal(x, y, FAST_TAP_DURATION_MS)
+
+    private fun performTapInternal(x: Int, y: Int, durationMs: Long): Boolean {
         val now = SystemClock.uptimeMillis()
         val elapsed = now - lastTapTime
         if (elapsed < minTapIntervalMs) {
@@ -78,7 +89,13 @@ class InputInjector(private val service: AccessibilityService) {
 
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val description = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, tapDurationMs))
+            .addStroke(
+                GestureDescription.StrokeDescription(
+                    path,
+                    0,
+                    durationMs.coerceAtLeast(20L)
+                )
+            )
             .build()
 
         val accepted = service.dispatchGesture(

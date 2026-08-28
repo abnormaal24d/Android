@@ -11,6 +11,7 @@ class DecisionEngine {
         private const val TAG = "DecisionEngine"
         private const val MAX_LOOKAHEAD_DEPTH = 5
         private const val SIMULATION_TIME_BUDGET_MS = 45L
+        private const val MISSION_TARGET_COMPLETION_MULTIPLIER = 5
     }
 
     private var lastBoardHash = 0
@@ -107,6 +108,12 @@ class DecisionEngine {
         return decision
     }
 
+    fun onActionVerified(board: BoardState) {
+        lastBoardHash = board.signature()
+        stuckCounter = 0
+        consecutiveWaits = 0
+    }
+
     private fun hasImmediateMerge(board: BoardState): Boolean = board.getMergeablePairs().isNotEmpty()
 
     private fun findBestMergeWithLookahead(board: BoardState): MoveDecision {
@@ -152,10 +159,10 @@ class DecisionEngine {
         maxDepth: Int,
         deadlineNanos: Long
     ): Int {
-        var score = evaluateMergeImmediate(t1, t2, board)
+        val simulatedBoard = board.simulateMerge(t1, t2)
+        var score = evaluateMergeImmediate(t1, t2, board, simulatedBoard)
         if (depth >= maxDepth || System.nanoTime() >= deadlineNanos) return score
 
-        val simulatedBoard = board.simulateMerge(t1, t2)
         val futurePairs = simulatedBoard.getMergeablePairs()
         if (futurePairs.isEmpty()) return score
 
@@ -179,9 +186,13 @@ class DecisionEngine {
         return score
     }
 
-    private fun evaluateMergeImmediate(t1: Tile, t2: Tile, board: BoardState): Int {
+    private fun evaluateMergeImmediate(
+        t1: Tile,
+        t2: Tile,
+        board: BoardState,
+        simulatedBoard: BoardState = board.simulateMerge(t1, t2)
+    ): Int {
         val newValue = t1.value * 2
-        val simulatedBoard = board.simulateMerge(t1, t2)
         var score = newValue * config.mergeWeight
 
         val mission = board.missionProgress
@@ -193,7 +204,7 @@ class DecisionEngine {
                 mission.existAmountValue > 0 &&
                 newValue >= mission.existAmountValue
             ) {
-                score += config.missionWeight * 5
+                score += config.missionWeight * MISSION_TARGET_COMPLETION_MULTIPLIER
             }
             if (mission.mergeCountTarget > 0 && mission.mergeCountCurrent < mission.mergeCountTarget) {
                 score += config.missionWeight
@@ -204,7 +215,7 @@ class DecisionEngine {
         score += estimateChainPotential(t1, t2, board, newValue) * config.chainBonus
         score += newValue * config.highValueBonus
 
-        if (isCorner(t2.row, t2.col, board.gridRows, board.gridCols)) {
+        if (isCorner(t1.row, t1.col, board.gridRows, board.gridCols)) {
             score += config.cornerBonus * newValue
         }
 
@@ -214,10 +225,11 @@ class DecisionEngine {
 
     private fun evaluateBoardQuality(board: BoardState): Int {
         var quality = 0
+        val mergeablePairs = board.getMergeablePairs()
         quality += calculateMonotonicity(board.tiles, board.gridRows, board.gridCols) * config.monotonicityWeight
         quality += calculateSmoothness(board.tiles, board.gridRows, board.gridCols) * config.smoothnessWeight
         quality += board.emptyCells.size * config.spaceWeight
-        quality += board.getMergeablePairs().size * config.chainBonus
+        quality += mergeablePairs.size * config.chainBonus
 
         val highest = board.getHighestTile()
         if (highest != null) {
@@ -228,14 +240,17 @@ class DecisionEngine {
             }
         }
 
-        quality -= boardRiskPenalty(board)
+        quality -= boardRiskPenalty(board, mergeablePairs)
         return quality
     }
 
-    private fun boardRiskPenalty(board: BoardState): Int {
+    private fun boardRiskPenalty(
+        board: BoardState,
+        mergeablePairs: List<Pair<Tile, Tile>> = board.getMergeablePairs()
+    ): Int {
         val capacity = (board.gridRows * board.gridCols).coerceAtLeast(1)
         val empty = board.emptyCells.size
-        val mobility = board.tiles.count { board.getEmptyNeighbors(it).isNotEmpty() } + board.getMergeablePairs().size
+        val mobility = board.tiles.count { board.getEmptyNeighbors(it).isNotEmpty() } + mergeablePairs.size
 
         var penalty = when (empty) {
             0 -> 8000
@@ -246,7 +261,7 @@ class DecisionEngine {
         }
 
         if (mobility <= 1) penalty += 2500
-        if (board.tiles.size >= capacity && board.getMergeablePairs().isEmpty()) penalty += 10000
+        if (board.tiles.size >= capacity && mergeablePairs.isEmpty()) penalty += 10000
         return penalty
     }
 
@@ -319,7 +334,7 @@ class DecisionEngine {
 
     private fun estimateChainPotential(t1: Tile, t2: Tile, board: BoardState, newValue: Int): Int {
         var potential = 0
-        val targetPos = t2.row to t2.col
+        val targetPos = t1.row to t1.col
 
         board.tiles.filter { it.value == newValue && it != t1 && it != t2 }.forEach { neighbor ->
             if (areAdjacent(targetPos, neighbor.row to neighbor.col)) potential++
@@ -351,10 +366,7 @@ class DecisionEngine {
 
     private fun isMissionComplete(board: BoardState): Boolean {
         val mission = board.missionProgress ?: return false
-        val mergeDone = mission.mergeCountTarget <= 0 || mission.mergeCountCurrent >= mission.mergeCountTarget
-        val existDone = mission.existAmountTarget <= 0 ||
-            missionExistCount(board, mission) >= mission.existAmountTarget
-        return mergeDone && existDone
+        return mission.isComplete(missionExistCount(board, mission))
     }
 
     private fun missionExistCount(board: BoardState, mission: MissionProgress): Int {
@@ -368,8 +380,6 @@ class DecisionEngine {
 
         val existCount = missionExistCount(board, mission)
         if (mission.existAmountTarget > 0 && existCount < mission.existAmountTarget) {
-            // There is no immediate merge (those are handled before this method). Do not tap an
-            // already-good tile; reposition instead so a future merge can build the missing target.
             val strategic = findStrategicMove(board)
             return strategic.copy(
                 reasoning = "Mission build ${mission.existAmountTarget}x ${mission.existAmountValue}+: ${strategic.reasoning}"
@@ -400,9 +410,12 @@ class DecisionEngine {
                 return MoveDecision.tap(t1, "Create space via merge").copy(confidence = 0.8f)
             }
 
-        val movableTiles = board.tiles.filter { board.getEmptyNeighbors(it).isNotEmpty() }
-        movableTiles.maxByOrNull { it.value }?.let { tile ->
-            val (row, col) = board.getEmptyNeighbors(tile).first()
+        val movableTiles = board.tiles.mapNotNull { tile ->
+            val neighbors = board.getEmptyNeighbors(tile)
+            if (neighbors.isEmpty()) null else tile to neighbors
+        }
+        movableTiles.maxByOrNull { (tile, _) -> tile.value }?.let { (tile, neighbors) ->
+            val (row, col) = neighbors.first()
             return MoveDecision.swipe(tile, row, col, "Move high tile to create space")
                 .copy(confidence = 0.6f)
         }
@@ -432,18 +445,19 @@ class DecisionEngine {
     )
 
     private fun findExploratoryMove(board: BoardState): MoveDecision {
-        val movableTiles = board.tiles
-            .filter { board.getEmptyNeighbors(it).isNotEmpty() }
-            .sortedByDescending { it.value }
+        val movableTiles = board.tiles.mapNotNull { tile ->
+            val neighbors = board.getEmptyNeighbors(tile)
+            if (neighbors.isEmpty()) null else tile to neighbors
+        }.sortedByDescending { (tile, _) -> tile.value }
 
-        movableTiles.firstOrNull()?.let { tile ->
-            val (row, col) = board.getEmptyNeighbors(tile).shuffled().first()
+        movableTiles.firstOrNull()?.let { (tile, neighbors) ->
+            val (row, col) = neighbors.random()
             return MoveDecision.swipe(tile, row, col, "Exploratory move: ${tile.value}")
                 .copy(confidence = 0.3f)
         }
 
-        val anyTile = board.tiles.shuffled().firstOrNull()
-        val empty = board.emptyCells.shuffled().firstOrNull()
+        val anyTile = board.tiles.randomOrNull()
+        val empty = board.emptyCells.randomOrNull()
         if (anyTile != null && empty != null) {
             return MoveDecision.swipe(anyTile, empty.first, empty.second, "Desperation move")
                 .copy(confidence = 0.1f)

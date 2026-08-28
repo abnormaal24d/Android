@@ -1,9 +1,8 @@
 package com.gimica.mergeblast.config
 
 import android.content.Context
-import android.content.SharedPreferences
+import android.util.Log
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 
 class BotConfig private constructor(
     val targetPackage: String = "com.gimica.mergeblast",
@@ -27,30 +26,65 @@ class BotConfig private constructor(
     val enableDebugLogging: Boolean = false
 ) {
     companion object {
+        private const val TAG = "BotConfig"
         private const val PREFS_NAME = "bot_config"
         private const val KEY_CONFIG_JSON = "config_json"
+        private const val DEFAULT_TARGET_PACKAGE = "com.gimica.mergeblast"
         private val gson = Gson()
 
         fun load(context: Context): BotConfig {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val json = prefs.getString(KEY_CONFIG_JSON, "") ?: ""
-            return if (json.isNotEmpty()) {
-                try {
-                    gson.fromJson(json, BotConfig::class.java)
-                } catch (e: Exception) {
+            val json = prefs.getString(KEY_CONFIG_JSON, "").orEmpty()
+            if (json.isBlank()) return BotConfig()
+
+            return try {
+                val parsed = gson.fromJson(json, BotConfig::class.java)
+                if (parsed == null) {
+                    Log.w(TAG, "Stored config decoded to null; using defaults")
                     BotConfig()
+                } else {
+                    parsed.normalized()
                 }
-            } else BotConfig()
+            } catch (e: Exception) {
+                Log.w(TAG, "Invalid stored bot config; using defaults", e)
+                BotConfig()
+            }
         }
 
         fun save(context: Context, config: BotConfig) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val json = gson.toJson(config)
+            val json = gson.toJson(config.normalized())
             prefs.edit().putString(KEY_CONFIG_JSON, json).apply()
         }
 
         fun getDefaults(): BotConfig = BotConfig()
     }
+
+    /**
+     * Clamp persisted or externally supplied values to ranges that keep the service responsive and
+     * gesture dispatch sane. Gson bypasses the private constructor, so validation must be explicit.
+     */
+    fun normalized(): BotConfig = BotConfig(
+        targetPackage = targetPackage.trim().takeIf { it.isNotEmpty() } ?: DEFAULT_TARGET_PACKAGE,
+        processIntervalMs = processIntervalMs.coerceIn(25L, 5_000L),
+        minMoveIntervalMs = minMoveIntervalMs.coerceIn(0L, 5_000L),
+        enableLookahead = enableLookahead,
+        lookaheadDepth = lookaheadDepth.coerceIn(0, 5),
+        mergeWeight = mergeWeight.coerceIn(0, 100_000),
+        chainBonus = chainBonus.coerceIn(0, 100_000),
+        spaceWeight = spaceWeight.coerceIn(0, 100_000),
+        missionWeight = missionWeight.coerceIn(0, 100_000),
+        highValueBonus = highValueBonus.coerceIn(0, 100_000),
+        cornerBonus = cornerBonus.coerceIn(0, 100_000),
+        monotonicityWeight = monotonicityWeight.coerceIn(0, 100_000),
+        smoothnessWeight = smoothnessWeight.coerceIn(0, 100_000),
+        tapDurationMs = tapDurationMs.coerceIn(20L, 2_000L),
+        swipeDurationMs = swipeDurationMs.coerceIn(80L, 3_000L),
+        maxRetries = maxRetries.coerceIn(0, 5),
+        retryDelayMs = retryDelayMs.coerceIn(0L, 5_000L),
+        enableHumanLikeTiming = enableHumanLikeTiming,
+        enableDebugLogging = enableDebugLogging
+    )
 
     fun copy(
         targetPackage: String = this.targetPackage,
@@ -92,7 +126,7 @@ class BotConfig private constructor(
         retryDelayMs = retryDelayMs,
         enableHumanLikeTiming = enableHumanLikeTiming,
         enableDebugLogging = enableDebugLogging
-    )
+    ).normalized()
 }
 
 class GameProfile(

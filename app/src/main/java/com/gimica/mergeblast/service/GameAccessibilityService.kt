@@ -136,6 +136,7 @@ class GameAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Debounced scheduler: at most one future tickRunnable is queued at a time. */
     private fun requestTick(delayMs: Long) {
         handler.removeCallbacks(tickRunnable)
         handler.postDelayed(tickRunnable, delayMs.coerceAtLeast(0L))
@@ -194,7 +195,8 @@ class GameAccessibilityService : AccessibilityService() {
 
         if (currentSignature != pending.beforeSignature) {
             pendingAction = null
-            stats.recordAction(true)
+            decisionEngine.onActionVerified(board)
+            stats.recordAction(success = true, decision = pending.decision)
             DebugLogger.i(
                 "Action verified after ${System.currentTimeMillis() - pending.dispatchedAt}ms: " +
                     "${pending.decision.action} - ${pending.decision.reasoning}"
@@ -219,7 +221,8 @@ class GameAccessibilityService : AccessibilityService() {
             return true
         }
 
-        val maxAttempts = config.maxRetries.coerceIn(1, 5)
+        // maxRetries means retries after the initial attempt, not total attempts.
+        val maxAttempts = 1 + config.maxRetries.coerceIn(0, 5)
         if (pending.attempts < maxAttempts) {
             val actionTimer = performanceMonitor.startTimer("retryAction")
             val accepted = try {
@@ -235,7 +238,7 @@ class GameAccessibilityService : AccessibilityService() {
                     attempts = nextAttempt
                 )
                 DebugLogger.w(
-                    "Action produced no board change; retry $nextAttempt/$maxAttempts"
+                    "Action produced no board change; retry ${nextAttempt - 1}/${maxAttempts - 1}"
                 )
                 broadcastState(board, MoveDecision.wait("Retrying unverified action"))
                 return true
@@ -243,7 +246,7 @@ class GameAccessibilityService : AccessibilityService() {
         }
 
         pendingAction = null
-        stats.recordAction(false)
+        stats.recordAction(success = false, decision = pending.decision)
         DebugLogger.w("Action failed verification: ${pending.decision.action} - ${pending.decision.reasoning}")
         broadcastState(board, MoveDecision.wait("Action failed verification; replanning"))
         return true
@@ -266,8 +269,8 @@ class GameAccessibilityService : AccessibilityService() {
             )
             DebugLogger.d("Action dispatched; awaiting verification - ${decision.reasoning}")
         } else {
-            stats.recordAction(false)
-            DebugLogger.w("Action dispatch rejected - ${decision.reasoning}")
+            stats.recordAction(success = false, decision = decision)
+            DebugLogger.w("Action dispatch rejected; next tick will replan - ${decision.reasoning}")
         }
     }
 
@@ -328,7 +331,7 @@ class GameAccessibilityService : AccessibilityService() {
     fun getPerformanceStats(): List<PerformanceMonitor.Stats> = performanceMonitor.getAllStats()
 
     fun updateConfig(newConfig: BotConfig) {
-        config = newConfig
+        config = newConfig.normalized()
         gameProfile = GameProfile.getOrDefault(config.targetPackage)
         applyRuntimeConfig()
         configureAccessibilityService()
@@ -363,9 +366,10 @@ class GameAccessibilityService : AccessibilityService() {
 
     data class BotStats(
         private var boardsProcessed: Long = 0,
+        private var decisionsMade: Long = 0,
         private var actionsExecuted: Long = 0,
         private var successfulActions: Long = 0,
-        private var mergesPerformed: Long = 0,
+        private var verifiedMerges: Long = 0,
         private var startTime: Long = System.currentTimeMillis(),
         private var lastLogTime: Long = 0
     ) {
@@ -374,14 +378,18 @@ class GameAccessibilityService : AccessibilityService() {
         }
 
         fun recordDecision(decision: MoveDecision) {
-            if (decision.action == MoveDecision.Action.TAP) {
-                mergesPerformed++
+            if (decision.action != MoveDecision.Action.WAIT && decision.action != MoveDecision.Action.NONE) {
+                decisionsMade++
             }
         }
 
-        fun recordAction(success: Boolean) {
+        fun recordAction(success: Boolean, decision: MoveDecision? = null) {
             actionsExecuted++
-            if (success) successfulActions++
+            if (success) {
+                successfulActions++
+                // Current engine represents actual merge commands as TAP; SWIPE is repositioning.
+                if (decision?.action == MoveDecision.Action.TAP) verifiedMerges++
+            }
         }
 
         fun shouldLogPeriodic(): Boolean {
@@ -396,24 +404,26 @@ class GameAccessibilityService : AccessibilityService() {
         fun summary(): String {
             val runtime = (System.currentTimeMillis() - startTime) / 1000
             val successRate = if (actionsExecuted > 0) successfulActions * 100 / actionsExecuted else 0
-            return "Runtime: ${runtime}s, Boards: $boardsProcessed, Actions: $actionsExecuted, " +
-                "Verified success: $successRate%, Merge decisions: $mergesPerformed"
+            return "Runtime: ${runtime}s, Boards: $boardsProcessed, Decisions: $decisionsMade, " +
+                "Actions: $actionsExecuted, Verified success: $successRate%, Verified merges: $verifiedMerges"
         }
 
         fun reset() {
             boardsProcessed = 0
+            decisionsMade = 0
             actionsExecuted = 0
             successfulActions = 0
-            mergesPerformed = 0
+            verifiedMerges = 0
             startTime = System.currentTimeMillis()
             lastLogTime = 0
         }
 
         fun toBundle(): android.os.Bundle = android.os.Bundle().apply {
             putLong("boardsProcessed", boardsProcessed)
+            putLong("decisionsMade", decisionsMade)
             putLong("actionsExecuted", actionsExecuted)
             putLong("successfulActions", successfulActions)
-            putLong("mergesPerformed", mergesPerformed)
+            putLong("verifiedMerges", verifiedMerges)
             putLong("runtimeMs", System.currentTimeMillis() - startTime)
         }
     }

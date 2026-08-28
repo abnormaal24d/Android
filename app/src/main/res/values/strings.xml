@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Merge Blast Auto Player</string>
+    <string name="accessibility_service_name">Game Auto Player</string>
+    <string name="accessibility_service_description">Automatisch het number-merging spel spelen via Accessibility Service</string>
+    <string name="enable_service">Accessibility Service inschakelen</string>
+    <string name="service_enabled">Service is ingeschakeld</string>
+    <string name="service_disabled">Service is uitgeschakeld</string>
+    <string name="start_bot">Bot starten</string>
+    <string name="stop_bot">Bot stoppen</string>
+    <string name="bot_running">Bot actief - speelt automatisch</string>
+    <string name="bot_stopped">Bot gestopt</string>
+    <string name="target_package">Doel package: com.gimica.mergeblast (Merge Blast)</string>
+</resources>

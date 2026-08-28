@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -87,6 +88,14 @@ class MainActivity : ComponentActivity() {
                             Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                         )
                     },
+                    onOpenAppInfo = {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
+                    },
                     onToggleBot = { toggleBotFromUi() },
                     isServiceEnabled = isServiceEnabledState,
                     isServiceReady = GameAccessibilityService.getInstance() != null,
@@ -152,6 +161,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen(
     onEnableAccessibility: () -> Unit,
+    onOpenAppInfo: () -> Unit,
     onToggleBot: () -> Unit,
     isServiceEnabled: Boolean,
     isServiceReady: Boolean,
@@ -200,13 +210,19 @@ fun MainScreen(
                 if (!isServiceEnabled) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Open Accessibility settings and enable Game Auto Player.",
+                        text = "Open Accessibility settings and enable Game Auto Player. " +
+                            "If Android blocks the switch for a sideloaded APK: open App info, " +
+                            "tap the three-dot menu, choose Allow restricted settings, then return here.",
                         fontSize = 12.sp,
                         color = Color.Gray
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = onEnableAccessibility) {
                         Text(context.getString(R.string.enable_service))
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = onOpenAppInfo) {
+                        Text("Open app info")
                     }
                 }
             }

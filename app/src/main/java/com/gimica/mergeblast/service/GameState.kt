@@ -46,14 +46,35 @@ data class BoardState(
     fun getHighestTile(): Tile? = tiles.maxByOrNull { it.value }
 
     /**
-     * Stable signature of the logical board. Screen bounds and timestamps are deliberately ignored,
-     * so this can be used to verify whether an injected action actually changed the game state.
+     * Stable signature of the observed logical state. Bounds and timestamps are deliberately
+     * ignored. Score/level/mission are included so accepted actions that change progression but
+     * temporarily leave the tile layout unchanged can still be verified.
      */
-    fun signature(): Int = tiles
-        .sortedWith(compareBy<Tile>({ it.row }, { it.col }, { it.value }))
-        .fold(17) { acc, tile ->
-            (((acc * 31 + tile.row) * 31 + tile.col) * 31 + tile.value)
+    fun signature(): Int {
+        var hash = tiles
+            .sortedWith(compareBy<Tile>({ it.row }, { it.col }, { it.value }))
+            .fold(17) { acc, tile ->
+                (((acc * 31 + tile.row) * 31 + tile.col) * 31 + tile.value)
+            }
+
+        hash = hash * 31 + gridRows
+        hash = hash * 31 + gridCols
+        hash = hash * 31 + score
+        hash = hash * 31 + currentLevel
+
+        missionProgress?.let { mission ->
+            hash = hash * 31 + mission.mergeCountTarget
+            hash = hash * 31 + mission.mergeCountCurrent
+            hash = hash * 31 + mission.existAmountTarget
+            hash = hash * 31 + mission.existAmountValue
+            hash = hash * 31 + mission.timeRemaining.hashCode()
+            mission.positionTargets.sortedWith(compareBy<Pair<Int, Int>>({ it.first }, { it.second }))
+                .forEach { (row, col) ->
+                    hash = (hash * 31 + row) * 31 + col
+                }
         }
+        return hash
+    }
 
     fun isStable(): Boolean = tiles.none { it.isMoving }
 
@@ -172,9 +193,9 @@ data class MissionProgress(
     val positionTargets: List<Pair<Int, Int>> = emptyList(),
     val timeRemaining: Long = 0
 ) {
-    fun isComplete(): Boolean {
-        val mergeDone = mergeCountTarget == 0 || mergeCountCurrent >= mergeCountTarget
-        val existDone = existAmountTarget == 0
+    fun isComplete(existingTargetCount: Int = 0): Boolean {
+        val mergeDone = mergeCountTarget <= 0 || mergeCountCurrent >= mergeCountTarget
+        val existDone = existAmountTarget <= 0 || existingTargetCount >= existAmountTarget
         return mergeDone && existDone
     }
 }

@@ -46,9 +46,9 @@ data class BoardState(
     fun getHighestTile(): Tile? = tiles.maxByOrNull { it.value }
 
     /**
-     * Stable signature of the observed logical state. Bounds and timestamps are deliberately
-     * ignored. Score/level/mission are included so accepted actions that change progression but
-     * temporarily leave the tile layout unchanged can still be verified.
+     * Stable signature for action verification. Bounds, timestamps, animation flags and countdown
+     * timers are deliberately ignored: those can change without the game accepting our gesture.
+     * Duplicate logical tiles are intentionally preserved in the hash as a corruption signal.
      */
     fun signature(): Int {
         var hash = tiles
@@ -67,7 +67,6 @@ data class BoardState(
             hash = hash * 31 + mission.mergeCountCurrent
             hash = hash * 31 + mission.existAmountTarget
             hash = hash * 31 + mission.existAmountValue
-            hash = hash * 31 + mission.timeRemaining.hashCode()
             mission.positionTargets.sortedWith(compareBy<Pair<Int, Int>>({ it.first }, { it.second }))
                 .forEach { (row, col) ->
                     hash = (hash * 31 + row) * 31 + col
@@ -80,7 +79,6 @@ data class BoardState(
 
     fun getMergeablePairs(): List<Pair<Tile, Tile>> {
         val pairs = mutableListOf<Pair<Tile, Tile>>()
-        // Right/down only prevents returning both A->B and B->A for the same pair.
         val directions = listOf(0 to 1, 1 to 0)
 
         tiles.forEach { tile ->
@@ -114,14 +112,17 @@ data class BoardState(
 
     /**
      * Resolve a logical grid cell to screen coordinates. Existing tile centers are preferred.
-     * Empty cells are estimated from the observed grid spacing, with tile-size fallback.
+     * For empty cells, extrapolate from the observed tile nearest to the target rather than from
+     * the source tile, which reduces coordinate error for longer repositioning swipes.
      */
     fun estimateCellCenter(row: Int, col: Int, anchor: Tile? = null): Pair<Int, Int>? {
         if (row !in 0 until gridRows || col !in 0 until gridCols) return null
 
         getTileAt(row, col)?.let { return it.centerX to it.centerY }
 
-        val reference = anchor ?: tiles.minByOrNull { abs(it.row - row) + abs(it.col - col) } ?: return null
+        val reference = tiles.minByOrNull { abs(it.row - row) + abs(it.col - col) }
+            ?: anchor
+            ?: return null
         val horizontalStep = estimateAxisStep(tiles.map { it.col to it.centerX })
             ?: (reference.bounds.width().coerceAtLeast(1) * 1.12f)
         val verticalStep = estimateAxisStep(tiles.map { it.row to it.centerY })
@@ -152,20 +153,24 @@ data class BoardState(
         val steps = entries.zipWithNext().mapNotNull { (a, b) ->
             val indexDelta = b.key - a.key
             if (indexDelta == 0) null else (b.value - a.value) / indexDelta
-        }.filter { abs(it) > 1f }
+        }.filter { abs(it) >= 1f }
 
         if (steps.isEmpty()) return null
         return steps.sorted()[steps.size / 2]
     }
 
+    /**
+     * Simulate the same semantics used by DecisionEngine: it taps tile1, so tile1 is the merge
+     * destination. Keeping the destination consistent matters for corner and chain scoring.
+     */
     fun simulateMerge(tile1: Tile, tile2: Tile): BoardState {
         val newTiles = tiles.toMutableList()
         val mergedValue = tile1.value * 2
-        val targetRow = tile2.row
-        val targetCol = tile2.col
+        val targetRow = tile1.row
+        val targetCol = tile1.col
 
         newTiles.removeAll { it == tile1 || it == tile2 }
-        newTiles.add(Tile(targetRow, targetCol, mergedValue, tile2.bounds))
+        newTiles.add(Tile(targetRow, targetCol, mergedValue, tile1.bounds))
 
         val occupied = newTiles.map { it.row to it.col }.toSet()
         val newEmptyCells = (0 until gridRows).flatMap { row ->
@@ -181,8 +186,13 @@ data class BoardState(
         )
     }
 
-    override fun toString(): String =
-        "BoardState(tiles=${tiles.size}, empty=${emptyCells.size}, score=$score, level=$currentLevel)"
+    override fun toString(): String {
+        val tileSummary = tiles
+            .sortedWith(compareBy<Tile>({ it.row }, { it.col }))
+            .joinToString(prefix = "[", postfix = "]") { "${it.row},${it.col}=${it.value}" }
+        return "BoardState(${gridRows}x$gridCols, tiles=$tileSummary, empty=${emptyCells.size}, " +
+            "score=$score, level=$currentLevel, mission=$missionProgress)"
+    }
 }
 
 data class MissionProgress(
@@ -203,9 +213,7 @@ data class MissionProgress(
 data class MoveDecision(
     val action: Action,
     val sourceTile: Tile? = null,
-    /** Logical destination row, not a screen Y coordinate. */
     val targetRow: Int = -1,
-    /** Logical destination column, not a screen X coordinate. */
     val targetCol: Int = -1,
     val confidence: Float = 0f,
     val reasoning: String = ""

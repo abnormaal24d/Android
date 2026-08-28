@@ -7,6 +7,8 @@ import android.graphics.Canvas
 import android.graphics.Path
 import android.graphics.Point
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 import com.google.mlkit.vision.common.InputImage
@@ -26,9 +28,6 @@ class AdScreenDetector {
     companion object {
         private const val TOP_ROI_FRACTION = 0.26f
         private const val BOTTOM_ROI_FRACTION = 0.46f
-
-        // Visual close detection is intentionally right-side only. A left countdown/icon must never
-        // be mistaken for a close button.
         private const val VISUAL_CLOSE_TOP_START = 0.02f
         private const val VISUAL_CLOSE_TOP_END = 0.20f
         private const val VISUAL_CLOSE_RIGHT_START = 0.80f
@@ -64,7 +63,6 @@ class AdScreenDetector {
         val width = bitmap.width
         val height = bitmap.height
 
-        // Strongest and cheapest path: a real graphical X in the upper-right safe zone.
         detectVisualCornerClose(bitmap)?.let { closePoint ->
             onSuccess(
                 AdVisualResult(
@@ -165,10 +163,6 @@ class AdScreenDetector {
         recognizer.close()
     }
 
-    /**
-     * Finds a neutral-white square-ish close glyph only in the upper-right corner. This is stricter
-     * than previous versions because a false positive inside an ad creative can open the store.
-     */
     private fun detectVisualCornerClose(bitmap: Bitmap): Point? {
         val width = bitmap.width
         val height = bitmap.height
@@ -282,9 +276,6 @@ class AdScreenDetector {
         if (label.isBlank()) return false
         val exact = CLOSE_MARKERS.any { marker -> label == marker || label.startsWith("$marker ") }
         if (!exact) return false
-
-        // Even textual close controls are only trusted in the upper area. This prevents subtitles,
-        // creative text or a CTA from becoming a tap target.
         return bounds.centerY() < height * 0.30f && bounds.centerX() > width * 0.62f
     }
 
@@ -314,6 +305,8 @@ object AdAutoCloser {
     private const val FAST_TAP_MS = 20L
     private const val MAX_AD_SESSION_MS = 20_000L
     private const val EXTERNAL_RECOVERY_COOLDOWN_MS = 450L
+    private const val LANDING_GUARD_INTERVAL_MS = 420L
+    private const val LANDING_GUARD_CHECKS = 12
 
     private const val PLAY_STORE_PACKAGE = "com.android.vending"
 
@@ -321,13 +314,54 @@ object AdAutoCloser {
     private var lastActionAt = 0L
     private var fallbackAttempts = 0
 
+    private val recoveryHandler = Handler(Looper.getMainLooper())
+    private var recoveryService: GameAccessibilityService? = null
+    private var recoveryChecksRemaining = 0
+
+    private val landingGuardRunnable = object : Runnable {
+        override fun run() {
+            val service = recoveryService ?: return
+            val now = SystemClock.uptimeMillis()
+
+            synchronized(this@AdAutoCloser) {
+                expireOldSession(now)
+                if (adDetectedAt == 0L || recoveryChecksRemaining <= 0) {
+                    stopLandingGuard()
+                    return
+                }
+
+                val foregroundPackage = service.rootInActiveWindow?.packageName?.toString()
+                if (foregroundPackage == PLAY_STORE_PACKAGE &&
+                    now - lastActionAt >= EXTERNAL_RECOVERY_COOLDOWN_MS
+                ) {
+                    if (service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)) {
+                        lastActionAt = now
+                        fallbackAttempts++
+                    }
+                }
+
+                // As soon as the game is foreground again the regular OCR loop takes over.
+                if (foregroundPackage == service.getConfig().targetPackage) {
+                    stopLandingGuard()
+                    return
+                }
+
+                recoveryChecksRemaining--
+                if (recoveryChecksRemaining > 0) {
+                    recoveryHandler.postDelayed(this, LANDING_GUARD_INTERVAL_MS)
+                } else {
+                    stopLandingGuard()
+                }
+            }
+        }
+    }
+
     @Synchronized
     fun isActive(): Boolean {
         expireOldSession(SystemClock.uptimeMillis())
         return adDetectedAt != 0L
     }
 
-    /** Cheap path used before secondary OCR. */
     @Synchronized
     fun tryFastAccessibility(service: GameAccessibilityService): String? {
         val scan = scanAccessibility(service.rootInActiveWindow)
@@ -338,6 +372,7 @@ object AdAutoCloser {
             markDetected(now)
             if (clickNodeOrParent(closeNode)) {
                 lastActionAt = now
+                scheduleLandingGuard(service)
                 return "Advertentie: sluitknop direct via Accessibility"
             }
         }
@@ -349,6 +384,7 @@ object AdAutoCloser {
             val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             lastActionAt = now
             fallbackAttempts++
+            scheduleLandingGuard(service)
             return if (accepted) {
                 "Advertentie: CTA herkend, Android Terug"
             } else {
@@ -369,6 +405,7 @@ object AdAutoCloser {
         scanAccessibility(service.rootInActiveWindow).closeNode?.let { closeNode ->
             if (clickNodeOrParent(closeNode)) {
                 lastActionAt = now
+                scheduleLandingGuard(service)
                 return "Advertentie: sluitknop via Accessibility"
             }
         }
@@ -379,6 +416,7 @@ object AdAutoCloser {
                 dispatchTap(service, point.x, point.y)
             ) {
                 lastActionAt = now
+                scheduleLandingGuard(service)
                 return "Advertentie: veilige X rechtsboven aangetikt"
             }
         }
@@ -393,16 +431,13 @@ object AdAutoCloser {
             val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             lastActionAt = now
             fallbackAttempts++
+            scheduleLandingGuard(service)
             if (accepted) return "Advertentie: Android Terug gestuurd"
         }
 
         return "Advertentie gedetecteerd; wachten op veilige X/Back"
     }
 
-    /**
-     * If an ad accidentally/externally opens the Play Store, immediately return to the game. This
-     * is active only during the short ad session, so manually opening Play Store later is untouched.
-     */
     @Synchronized
     fun recoverExternalLanding(service: GameAccessibilityService, foregroundPackage: String?): String? {
         val now = SystemClock.uptimeMillis()
@@ -416,6 +451,7 @@ object AdAutoCloser {
         val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
         lastActionAt = now
         fallbackAttempts++
+        scheduleLandingGuard(service)
         return if (accepted) {
             "Advertentie opende Google Play; automatisch terug naar spel"
         } else {
@@ -433,6 +469,19 @@ object AdAutoCloser {
             point.y > result.screenHeight * 0.01f &&
             point.y < result.screenHeight * 0.22f
 
+    private fun scheduleLandingGuard(service: GameAccessibilityService) {
+        recoveryService = service
+        recoveryChecksRemaining = LANDING_GUARD_CHECKS
+        recoveryHandler.removeCallbacks(landingGuardRunnable)
+        recoveryHandler.postDelayed(landingGuardRunnable, LANDING_GUARD_INTERVAL_MS)
+    }
+
+    private fun stopLandingGuard() {
+        recoveryHandler.removeCallbacks(landingGuardRunnable)
+        recoveryChecksRemaining = 0
+        recoveryService = null
+    }
+
     private fun markDetected(now: Long) {
         if (adDetectedAt == 0L) {
             adDetectedAt = now
@@ -448,6 +497,7 @@ object AdAutoCloser {
         adDetectedAt = 0L
         lastActionAt = 0L
         fallbackAttempts = 0
+        stopLandingGuard()
     }
 
     private data class AccessibilityScan(
@@ -514,8 +564,6 @@ object AdAutoCloser {
             label.contains("ad sluiten")
         if (!looksClose) return false
 
-        // Require the Accessibility close node itself to live in the upper-right area. This guards
-        // against mislabeled creative/CTA nodes whose clickable parent covers most of the ad.
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         val root = node.window?.root ?: return false
@@ -527,8 +575,6 @@ object AdAutoCloser {
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
-        // Clicking a huge parent can hit the ad creative. Only climb while the candidate remains a
-        // compact upper control instead of taking an arbitrary clickable ancestor.
         var current: AccessibilityNodeInfo? = node
         repeat(3) {
             val candidate = current ?: return false

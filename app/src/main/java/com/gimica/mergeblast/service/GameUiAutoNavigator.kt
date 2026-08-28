@@ -44,17 +44,26 @@ object GameUiAutoNavigator {
     ): String? {
         if (screenWidth <= 0 || screenHeight <= 0) return null
 
-        val elements = ArrayList<LabeledElement>(24)
+        val labels = ArrayList<LabeledElement>(32)
         val normalizedAll = StringBuilder()
 
         for (block in text.textBlocks) {
             for (line in block.lines) {
+                val lineLabel = normalize(line.text)
+                val lineBounds = line.boundingBox
+                if (lineLabel.isNotBlank() && lineBounds != null) {
+                    labels += LabeledElement(
+                        lineLabel,
+                        Rect(lineBounds).apply { offset(xOffset, yOffset) }
+                    )
+                }
+
                 for (element in line.elements) {
                     val label = normalize(element.text)
                     if (label.isBlank()) continue
                     val sourceBounds = element.boundingBox ?: continue
                     val bounds = Rect(sourceBounds).apply { offset(xOffset, yOffset) }
-                    elements += LabeledElement(label, bounds)
+                    labels += LabeledElement(label, bounds)
                     if (normalizedAll.isNotEmpty()) normalizedAll.append(' ')
                     normalizedAll.append(label)
                 }
@@ -68,12 +77,7 @@ object GameUiAutoNavigator {
             (containsWord(all, "try again") || containsWord(all, "home") || containsWord(all, "score"))
 
         if (isPaused) {
-            val continueElement = elements.firstOrNull { element ->
-                element.label == "continue" ||
-                    element.label == "resume" ||
-                    element.label == "doorgaan" ||
-                    element.label == "verder"
-            }
+            val continueElement = labels.firstOrNull { element -> isContinueLabel(element.label) }
 
             if (continueElement != null) {
                 return dispatchWithCooldown(
@@ -92,8 +96,8 @@ object GameUiAutoNavigator {
 
         // Main menu. LEVEL + SHOP is a strong pair on this game's home screen. MERGE/BLAST may be
         // stylized and occasionally missed by OCR, so they are supportive rather than mandatory.
-        val hasLevel = elements.any { it.label == "level" }
-        val hasShop = elements.any { it.label == "shop" }
+        val hasLevel = labels.any { it.label == "level" }
+        val hasShop = labels.any { it.label == "shop" }
         val hasLogo = containsWord(all, "merge") || containsWord(all, "blast")
         val looksLikeMainMenu = hasLevel && hasShop &&
             !containsWord(all, "paused") && !containsWord(all, "continue")
@@ -153,6 +157,13 @@ object GameUiAutoNavigator {
             .build()
         return service.dispatchGesture(gesture, null, null)
     }
+
+    private fun isContinueLabel(label: String): Boolean =
+        label == "continue" ||
+            label == "resume" ||
+            label == "doorgaan" ||
+            label == "verder" ||
+            label.replace(" ", "") == "continue"
 
     private fun normalize(value: String): String = value
         .trim()

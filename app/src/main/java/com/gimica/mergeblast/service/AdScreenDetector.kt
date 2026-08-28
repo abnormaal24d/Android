@@ -18,40 +18,43 @@ import java.util.ArrayDeque
 import kotlin.math.abs
 
 /**
- * Fast, conservative interstitial detector.
+ * Fast ad detector/closer for full-screen interstitials and rewarded ads.
  *
- * The important distinction is between a real close/skip control and a store CTA. If the screen
- * contains Google Play / Install / Download evidence we prefer Android Back immediately and never
- * infer a graphical >> button as a close control. This avoids opening Play Store while still
- * leaving explicit OCR Close/X/Skip controls usable.
+ * Safety policy:
+ * 1. Explicit X/Close/Skip controls are always preferred.
+ * 2. CTA-heavy ads are exited with Android Back first.
+ * 3. A graphical upper-right >> control is only tried after Back has failed repeatedly.
+ * 4. Store CTAs (Google Play / Install / Download) NEVER allow an inferred >> tap.
  */
 class AdScreenDetector {
     companion object {
-        private const val TOP_ROI_FRACTION = 0.28f
-        private const val BOTTOM_ROI_FRACTION = 0.48f
+        private const val TOP_ROI_FRACTION = 0.30f
+        private const val BOTTOM_ROI_FRACTION = 0.52f
 
-        // Narrow safe control band: below the Android status bar and above common mute/CTA buttons.
         private const val SAFE_CONTROL_LEFT = 0.78f
-        private const val SAFE_CONTROL_TOP = 0.045f
-        private const val SAFE_CONTROL_BOTTOM = 0.12f
+        private const val SAFE_CONTROL_TOP = 0.035f
+        private const val SAFE_CONTROL_BOTTOM = 0.14f
 
         private val STORE_CTA_MARKERS = listOf(
             "google play", "get it on", "app store", "installeren", "install", "download",
             "open app", "openen", "get app", "get the app"
         )
 
-        private val AD_CTA_MARKERS = STORE_CTA_MARKERS + listOf(
-            "play now", "speel nu", "spin", "start playing", "start game", "play game"
+        private val GENERIC_CTA_MARKERS = listOf(
+            "play now", "speel nu", "spin", "start playing", "start game", "play game",
+            "explore more", "discover more", "learn more", "meer informatie", "see more",
+            "visit site", "visit website", "shop now", "buy now", "get started", "try now",
+            "watch more", "read more", "sign up", "register now", "claim now", "continue"
         )
 
         private val AD_CONTEXT_MARKERS = listOf(
             "advertentie", "advertisement", "sponsored", "gesponsord", "adchoices",
-            "ad choices", "learn more", "meer informatie", "rewarded ad", "reward ad"
+            "ad choices", "rewarded ad", "reward ad", "promoted", "promotion"
         )
 
         private val CLOSE_MARKERS = listOf(
             "sluiten", "close", "close ad", "overslaan", "skip", "skip ad", "dismiss",
-            "nee bedankt", "no thanks", "done", "klaar", "next", "×", "✕", "✖", "x"
+            "nee bedankt", "no thanks", "done", "klaar", "×", "✕", "✖", "x"
         )
     }
 
@@ -63,17 +66,7 @@ class AdScreenDetector {
         onFailure: (Exception) -> Unit
     ) {
         if (bitmap.width <= 0 || bitmap.height <= 0) {
-            onSuccess(
-                AdVisualResult(
-                    isAd = false,
-                    strongEvidence = false,
-                    closePoint = null,
-                    recognizedText = "",
-                    screenWidth = bitmap.width,
-                    screenHeight = bitmap.height,
-                    preferBack = false
-                )
-            )
+            onSuccess(AdVisualResult(false, false, null, "", bitmap.width, bitmap.height))
             return
         }
 
@@ -107,63 +100,56 @@ class AdScreenDetector {
 
         recognizer.process(InputImage.fromBitmap(composite, 0))
             .addOnSuccessListener { text ->
-                val normalizedText = text.text.lowercase().replace('\n', ' ')
-                val hasStoreCta = STORE_CTA_MARKERS.any(normalizedText::contains)
-                val hasCta = AD_CTA_MARKERS.any(normalizedText::contains)
-                val hasAdContext = AD_CONTEXT_MARKERS.any(normalizedText::contains)
+                val normalized = text.text.lowercase().replace('\n', ' ')
+                val hasStoreCta = STORE_CTA_MARKERS.any(normalized::contains)
+                val hasGenericCta = GENERIC_CTA_MARKERS.any(normalized::contains)
+                val hasAdContext = AD_CONTEXT_MARKERS.any(normalized::contains)
 
                 var hasCountdown = false
-                var explicitClosePoint: Point? = null
+                var explicitClose: Point? = null
 
                 outer@ for (block in text.textBlocks) {
                     for (line in block.lines) {
                         for (element in line.elements) {
                             val raw = element.boundingBox ?: continue
-                            val original = mapCompositeBounds(raw, topHeight, bottomTop)
+                            val bounds = mapCompositeBounds(raw, topHeight, bottomTop)
                             val label = element.text.trim().lowercase()
 
                             if (!hasCountdown &&
                                 label.matches(Regex("\\d{1,2}")) &&
-                                original.centerY() < height * 0.22f
+                                bounds.centerY() < height * 0.22f
                             ) {
                                 hasCountdown = true
                             }
 
-                            if (isCloseLabel(label, original, width, height)) {
-                                explicitClosePoint = Point(original.centerX(), original.centerY())
+                            if (isCloseLabel(label, bounds, width, height)) {
+                                explicitClose = Point(bounds.centerX(), bounds.centerY())
                                 break@outer
                             }
                         }
                     }
                 }
 
-                val establishedAdContext = hasAdContext || hasCta || hasCountdown
-
-                // Critical safety rule: a screen that advertises Google Play/Install/Download often
-                // has a >> CTA in the upper-right. Never infer that glyph as Close. Back is both
-                // faster and safer for those layouts. A literal OCR X/Close/Skip remains allowed.
-                val inferredClosePoint = if (
-                    explicitClosePoint == null && establishedAdContext && !hasStoreCta
+                val isAd = hasStoreCta || hasGenericCta || hasAdContext || hasCountdown
+                val inferredControl = if (
+                    isAd && explicitClose == null && !hasStoreCta
                 ) {
                     detectContextualUpperRightControl(bitmap)
                 } else {
                     null
                 }
 
-                val closePoint = explicitClosePoint ?: inferredClosePoint
-                val closeWithCountdown = closePoint != null && hasCountdown
-                val isAd = hasStoreCta || hasCta || hasAdContext || closeWithCountdown
-                val strongEvidence = hasStoreCta || hasCta || hasAdContext || closeWithCountdown
-
                 onSuccess(
                     AdVisualResult(
                         isAd = isAd,
-                        strongEvidence = strongEvidence,
-                        closePoint = closePoint,
-                        recognizedText = normalizedText.take(500),
+                        strongEvidence = hasStoreCta || hasGenericCta || hasAdContext,
+                        closePoint = explicitClose ?: inferredControl,
+                        recognizedText = normalized.take(600),
                         screenWidth = width,
                         screenHeight = height,
-                        preferBack = hasStoreCta
+                        preferBack = (hasStoreCta || hasGenericCta) && explicitClose == null,
+                        explicitClose = explicitClose != null,
+                        inferredTapAllowed = !hasStoreCta
                     )
                 )
             }
@@ -173,13 +159,11 @@ class AdScreenDetector {
             }
     }
 
-    fun close() {
-        recognizer.close()
-    }
+    fun close() = recognizer.close()
 
     /**
-     * Pixel fallback used only after ad context is established AND there is no store CTA.
-     * It supports graphical X and >>/skip controls for rewarded ads such as the Scarab layout.
+     * Detect a compact bright X / chevron / fast-forward control in the extreme upper-right.
+     * This is never sufficient by itself to classify a screen as an ad.
      */
     private fun detectContextualUpperRightControl(bitmap: Bitmap): Point? {
         val width = bitmap.width
@@ -187,35 +171,32 @@ class AdScreenDetector {
         val minDimension = minOf(width, height)
         if (minDimension < 100) return null
 
-        val regionLeft = (width * SAFE_CONTROL_LEFT).toInt().coerceIn(0, width - 1)
-        val regionRight = width
-        val yStart = (height * SAFE_CONTROL_TOP).toInt().coerceIn(0, height - 1)
-        val yEnd = (height * SAFE_CONTROL_BOTTOM).toInt().coerceIn(yStart + 1, height)
-        val regionWidth = regionRight - regionLeft
-        val regionHeight = yEnd - yStart
+        val left = (width * SAFE_CONTROL_LEFT).toInt().coerceIn(0, width - 1)
+        val top = (height * SAFE_CONTROL_TOP).toInt().coerceIn(0, height - 1)
+        val bottom = (height * SAFE_CONTROL_BOTTOM).toInt().coerceIn(top + 1, height)
+        val regionWidth = width - left
+        val regionHeight = bottom - top
         if (regionWidth <= 0 || regionHeight <= 0) return null
 
         val count = regionWidth * regionHeight
         val pixels = IntArray(count)
-        bitmap.getPixels(pixels, 0, regionWidth, regionLeft, yStart, regionWidth, regionHeight)
+        bitmap.getPixels(pixels, 0, regionWidth, left, top, regionWidth, regionHeight)
 
         val bright = BooleanArray(count)
-        for (index in pixels.indices) {
-            val color = pixels[index]
-            val red = color ushr 16 and 0xff
-            val green = color ushr 8 and 0xff
-            val blue = color and 0xff
-            val maxChannel = maxOf(red, green, blue)
-            val minChannel = minOf(red, green, blue)
-            bright[index] = red >= 205 && green >= 205 && blue >= 205 &&
-                maxChannel - minChannel <= 52
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val r = c ushr 16 and 0xff
+            val g = c ushr 8 and 0xff
+            val b = c and 0xff
+            bright[i] = r >= 200 && g >= 200 && b >= 200 &&
+                maxOf(r, g, b) - minOf(r, g, b) <= 58
         }
 
         val visited = BooleanArray(count)
         val stack = IntArray(count)
-        val minSide = (minDimension * 0.008f).toInt().coerceAtLeast(5)
-        val maxSide = (minDimension * 0.10f).toInt().coerceAtLeast(minSide + 1)
-        var bestPoint: Point? = null
+        val minSide = (minDimension * 0.007f).toInt().coerceAtLeast(5)
+        val maxSide = (minDimension * 0.11f).toInt().coerceAtLeast(minSide + 1)
+        var best: Point? = null
         var bestScore = Float.NEGATIVE_INFINITY
 
         for (start in 0 until count) {
@@ -224,7 +205,6 @@ class AdScreenDetector {
             var stackSize = 0
             stack[stackSize++] = start
             visited[start] = true
-
             var area = 0
             var minX = regionWidth
             var maxX = -1
@@ -233,22 +213,22 @@ class AdScreenDetector {
 
             while (stackSize > 0) {
                 val current = stack[--stackSize]
-                val localY = current / regionWidth
-                val localX = current - localY * regionWidth
+                val y = current / regionWidth
+                val x = current - y * regionWidth
                 area++
-                if (localX < minX) minX = localX
-                if (localX > maxX) maxX = localX
-                if (localY < minY) minY = localY
-                if (localY > maxY) maxY = localY
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
 
                 for (dy in -1..1) {
-                    val nextY = localY + dy
-                    if (nextY !in 0 until regionHeight) continue
+                    val ny = y + dy
+                    if (ny !in 0 until regionHeight) continue
                     for (dx in -1..1) {
                         if (dx == 0 && dy == 0) continue
-                        val nextX = localX + dx
-                        if (nextX !in 0 until regionWidth) continue
-                        val next = nextY * regionWidth + nextX
+                        val nx = x + dx
+                        if (nx !in 0 until regionWidth) continue
+                        val next = ny * regionWidth + nx
                         if (bright[next] && !visited[next]) {
                             visited[next] = true
                             stack[stackSize++] = next
@@ -257,46 +237,38 @@ class AdScreenDetector {
                 }
             }
 
-            if (maxX < minX || maxY < minY || area < 10) continue
-            val componentWidth = maxX - minX + 1
-            val componentHeight = maxY - minY + 1
-            if (componentWidth !in minSide..maxSide || componentHeight !in minSide..maxSide) continue
+            if (maxX < minX || maxY < minY || area < 8) continue
+            val w = maxX - minX + 1
+            val h = maxY - minY + 1
+            if (w !in minSide..maxSide || h !in minSide..maxSide) continue
 
-            val aspect = componentWidth.toFloat() / componentHeight.toFloat()
-            if (aspect !in 0.30f..3.20f) continue
+            val aspect = w.toFloat() / h.toFloat()
+            if (aspect !in 0.25f..3.6f) continue
+            val fill = area.toFloat() / (w * h).toFloat()
+            if (fill !in 0.04f..0.90f) continue
 
-            val fillRatio = area.toFloat() / (componentWidth * componentHeight).toFloat()
-            if (fillRatio !in 0.05f..0.88f) continue
+            val point = Point(left + (minX + maxX) / 2, top + (minY + maxY) / 2)
+            if (!isSafeExplicitClosePoint(point, width, height)) continue
 
-            val centerX = regionLeft + (minX + maxX) / 2
-            val centerY = yStart + (minY + maxY) / 2
-            val candidate = Point(centerX, centerY)
-            if (!isSafeExplicitClosePoint(candidate, width, height)) continue
-
-            val sizeScore = area + minOf(componentWidth, componentHeight) * 6f
-            val rightEdgeBonus = centerX.toFloat() / width * 80f
-            val shapePenalty = abs(aspect - 1.6f) * 4f
-            val score = sizeScore + rightEdgeBonus - shapePenalty
+            val rightBonus = point.x.toFloat() / width * 100f
+            val sizeScore = area + minOf(w, h) * 7f
+            val shapePenalty = abs(aspect - 1.4f) * 3f
+            val score = sizeScore + rightBonus - shapePenalty
             if (score > bestScore) {
                 bestScore = score
-                bestPoint = candidate
+                best = point
             }
         }
-
-        return bestPoint
+        return best
     }
 
-    private fun mapCompositeBounds(bounds: Rect, topHeight: Int, bottomTop: Int): Rect {
-        val mapped = Rect(bounds)
-        if (bounds.centerY() >= topHeight) mapped.offset(0, bottomTop - topHeight)
-        return mapped
-    }
+    private fun mapCompositeBounds(bounds: Rect, topHeight: Int, bottomTop: Int): Rect =
+        Rect(bounds).also { if (bounds.centerY() >= topHeight) it.offset(0, bottomTop - topHeight) }
 
     private fun isCloseLabel(label: String, bounds: Rect, width: Int, height: Int): Boolean {
         if (label.isBlank()) return false
-        val exact = CLOSE_MARKERS.any { marker -> label == marker || label.startsWith("$marker ") }
-        if (!exact) return false
-        return isSafeExplicitClosePoint(Point(bounds.centerX(), bounds.centerY()), width, height)
+        val match = CLOSE_MARKERS.any { marker -> label == marker || label.startsWith("$marker ") }
+        return match && isSafeExplicitClosePoint(Point(bounds.centerX(), bounds.centerY()), width, height)
     }
 
     private fun isSafeExplicitClosePoint(point: Point, width: Int, height: Int): Boolean =
@@ -312,23 +284,22 @@ data class AdVisualResult(
     val recognizedText: String,
     val screenWidth: Int,
     val screenHeight: Int,
-    val preferBack: Boolean = false
+    val preferBack: Boolean = false,
+    val explicitClose: Boolean = false,
+    val inferredTapAllowed: Boolean = true
 )
 
-/**
- * Stateful interstitial closer. Strong ads are exited aggressively, but explicit taps remain
- * restricted to validated close/skip points. Store CTA screens always prefer Android Back.
- */
 object AdAutoCloser {
-    // Below the 340ms screenshot interval so each new ad frame may trigger another Back if needed.
-    private const val ACTION_COOLDOWN_MS = 180L
-    private const val EXPLICIT_CLOSE_COOLDOWN_MS = 120L
-    private const val WEAK_BACK_DELAY_MS = 340L
+    private const val ACTION_COOLDOWN_MS = 170L
+    private const val EXPLICIT_CLOSE_COOLDOWN_MS = 100L
+    private const val WEAK_BACK_DELAY_MS = 320L
+    private const val INFERRED_CONTROL_DELAY_MS = 650L
+    private const val BACK_ATTEMPTS_BEFORE_INFERRED = 2
     private const val FAST_TAP_MS = 20L
-    private const val MAX_AD_SESSION_MS = 30_000L
-    private const val EXTERNAL_RECOVERY_COOLDOWN_MS = 250L
-    private const val LANDING_GUARD_INTERVAL_MS = 250L
-    private const val LANDING_GUARD_CHECKS = 24
+    private const val MAX_AD_SESSION_MS = 35_000L
+    private const val EXTERNAL_RECOVERY_COOLDOWN_MS = 220L
+    private const val LANDING_GUARD_INTERVAL_MS = 220L
+    private const val LANDING_GUARD_CHECKS = 30
 
     private const val PLAY_STORE_PACKAGE = "com.android.vending"
 
@@ -344,7 +315,6 @@ object AdAutoCloser {
         override fun run() {
             val service = recoveryService ?: return
             val now = SystemClock.uptimeMillis()
-
             synchronized(this@AdAutoCloser) {
                 expireOldSession(now)
                 if (adDetectedAt == 0L || recoveryChecksRemaining <= 0) {
@@ -352,8 +322,8 @@ object AdAutoCloser {
                     return
                 }
 
-                val foregroundPackage = service.rootInActiveWindow?.packageName?.toString()
-                if (foregroundPackage == PLAY_STORE_PACKAGE &&
+                val foreground = service.rootInActiveWindow?.packageName?.toString()
+                if (foreground == PLAY_STORE_PACKAGE &&
                     now - lastActionAt >= EXTERNAL_RECOVERY_COOLDOWN_MS
                 ) {
                     if (service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)) {
@@ -362,7 +332,7 @@ object AdAutoCloser {
                     }
                 }
 
-                if (foregroundPackage == service.getConfig().targetPackage) {
+                if (foreground == service.getConfig().targetPackage) {
                     stopLandingGuard()
                     return
                 }
@@ -383,37 +353,40 @@ object AdAutoCloser {
         return adDetectedAt != 0L
     }
 
-    /** Fastest path: Accessibility evidence -> close node, otherwise immediate Back. */
+    /**
+     * Cheap first pass. Two Back attempts are allowed; after that return null so visual OCR can
+     * inspect for an explicit X or a safe graphical control instead of looping on Back forever.
+     */
     @Synchronized
     fun tryFastAccessibility(service: GameAccessibilityService): String? {
         val scan = scanAccessibility(service.rootInActiveWindow)
         val now = SystemClock.uptimeMillis()
         expireOldSession(now)
 
-        scan.closeNode?.let { closeNode ->
+        scan.closeNode?.let { node ->
             markDetected(now)
-            if (clickNodeOrParent(closeNode)) {
+            if (clickNodeOrParent(node)) {
                 lastActionAt = now
                 scheduleLandingGuard(service)
-                return "Advertentie: sluit/skip-knop direct via Accessibility"
+                return "Advertentie: expliciete sluit/skip-knop via Accessibility"
             }
         }
 
         if (!scan.adEvidence) return null
         markDetected(now)
 
-        if (now - lastActionAt >= ACTION_COOLDOWN_MS) {
-            val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-            lastActionAt = now
-            fallbackAttempts++
-            scheduleLandingGuard(service)
-            return if (accepted) {
-                "Advertentie: evidence gevonden, direct Android Terug"
-            } else {
-                "Advertentie herkend; Back nog niet geaccepteerd"
-            }
+        if (fallbackAttempts >= BACK_ATTEMPTS_BEFORE_INFERRED) return null
+        if (now - lastActionAt < ACTION_COOLDOWN_MS) return "Advertentie: snelle Back-cooldown"
+
+        val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        lastActionAt = now
+        fallbackAttempts++
+        scheduleLandingGuard(service)
+        return if (accepted) {
+            "Advertentie: direct Android Terug (${fallbackAttempts}/$BACK_ATTEMPTS_BEFORE_INFERRED)"
+        } else {
+            "Advertentie: Back nog niet geaccepteerd"
         }
-        return "Advertentie herkend; snelle Back-cooldown"
     }
 
     @Synchronized
@@ -423,91 +396,100 @@ object AdAutoCloser {
         val now = SystemClock.uptimeMillis()
         expireOldSession(now)
         markDetected(now)
+        val age = now - adDetectedAt
 
-        val scan = scanAccessibility(service.rootInActiveWindow)
-        scan.closeNode?.let { closeNode ->
-            if (clickNodeOrParent(closeNode)) {
+        scanAccessibility(service.rootInActiveWindow).closeNode?.let { node ->
+            if (clickNodeOrParent(node)) {
                 lastActionAt = now
                 scheduleLandingGuard(service)
-                return "Advertentie: sluit/skip-knop via Accessibility"
+                return "Advertentie: expliciete sluit/skip-knop via Accessibility"
             }
         }
 
-        // Google Play / Install / Download layouts are especially risky: their >> control is a CTA,
-        // not Skip. Exit with Back before considering any inferred graphical control.
-        if (result.preferBack && now - lastActionAt >= ACTION_COOLDOWN_MS) {
+        // Literal OCR X/Close/Skip is the most trustworthy visual tap and may be used immediately.
+        if (result.explicitClose) {
+            result.closePoint?.let { point ->
+                if (isSafeExplicitClosePoint(result, point) &&
+                    now - lastActionAt >= EXPLICIT_CLOSE_COOLDOWN_MS &&
+                    dispatchTap(service, point.x, point.y)
+                ) {
+                    lastActionAt = now
+                    scheduleLandingGuard(service)
+                    return "Advertentie: expliciete X/Close/Skip aangetikt"
+                }
+            }
+        }
+
+        // CTA screens: Back first. This covers Explore More/Learn More/Shop Now and store ads.
+        if (result.preferBack && fallbackAttempts < BACK_ATTEMPTS_BEFORE_INFERRED) {
+            if (now - lastActionAt < ACTION_COOLDOWN_MS) return "Advertentie: snelle Back-cooldown"
             val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             lastActionAt = now
             fallbackAttempts++
             scheduleLandingGuard(service)
             return if (accepted) {
-                "Advertentie met store-CTA: direct Android Terug"
+                "CTA-advertentie: Android Terug (${fallbackAttempts}/$BACK_ATTEMPTS_BEFORE_INFERRED)"
             } else {
-                "Store-ad herkend; Back nog niet geaccepteerd"
+                "CTA-advertentie: Back nog niet geaccepteerd"
             }
         }
 
-        result.closePoint?.let { point ->
-            if (isSafeExplicitClosePoint(result, point) &&
-                now - lastActionAt >= EXPLICIT_CLOSE_COOLDOWN_MS &&
-                dispatchTap(service, point.x, point.y)
-            ) {
-                lastActionAt = now
-                scheduleLandingGuard(service)
-                return "Advertentie: veilige sluit/skip-control aangetikt"
+        // If Back clearly failed twice, a non-store ad may expose a graphical >>/skip control.
+        if (!result.explicitClose &&
+            result.inferredTapAllowed &&
+            fallbackAttempts >= BACK_ATTEMPTS_BEFORE_INFERRED &&
+            age >= INFERRED_CONTROL_DELAY_MS
+        ) {
+            result.closePoint?.let { point ->
+                if (isSafeExplicitClosePoint(result, point) &&
+                    now - lastActionAt >= EXPLICIT_CLOSE_COOLDOWN_MS &&
+                    dispatchTap(service, point.x, point.y)
+                ) {
+                    lastActionAt = now
+                    scheduleLandingGuard(service)
+                    return "Advertentie: grafische skip-control na mislukte Back aangetikt"
+                }
             }
         }
 
-        if (now - lastActionAt < ACTION_COOLDOWN_MS) {
-            return "Advertentie gedetecteerd; snelle cooldown"
-        }
+        if (now - lastActionAt < ACTION_COOLDOWN_MS) return "Advertentie: snelle actie-cooldown"
 
-        val age = now - adDetectedAt
         if (result.strongEvidence || age >= WEAK_BACK_DELAY_MS) {
             val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             lastActionAt = now
             fallbackAttempts++
             scheduleLandingGuard(service)
             return if (accepted) {
-                "Advertentie: direct Android Terug gestuurd"
+                "Advertentie: Android Terug opnieuw gestuurd"
             } else {
                 "Advertentie: Back geweigerd; volgende frame opnieuw"
             }
         }
 
-        return "Advertentie gedetecteerd; veilige close/Back afwachten"
+        return "Advertentie gedetecteerd; wachten op veilige exit"
     }
 
     @Synchronized
     fun recoverExternalLanding(service: GameAccessibilityService, foregroundPackage: String?): String? {
         val now = SystemClock.uptimeMillis()
         expireOldSession(now)
-        if (adDetectedAt == 0L) return null
-        if (foregroundPackage != PLAY_STORE_PACKAGE) return null
-        if (now - lastActionAt < EXTERNAL_RECOVERY_COOLDOWN_MS) {
-            return "Advertentie opende Google Play; herstel in cooldown"
-        }
+        if (adDetectedAt == 0L || foregroundPackage != PLAY_STORE_PACKAGE) return null
+        if (now - lastActionAt < EXTERNAL_RECOVERY_COOLDOWN_MS) return "Google Play-herstel in cooldown"
 
         val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
         lastActionAt = now
         fallbackAttempts++
         scheduleLandingGuard(service)
-        return if (accepted) {
-            "Advertentie opende Google Play; automatisch terug"
-        } else {
-            "Google Play gedetecteerd; Back nog niet beschikbaar"
-        }
+        return if (accepted) "Google Play automatisch gesloten" else "Google Play: Back nog niet beschikbaar"
     }
 
     @Synchronized
-    fun onGameVisible() {
-        clearSession()
-    }
+    fun onGameVisible() = clearSession()
 
     private fun isSafeExplicitClosePoint(result: AdVisualResult, point: Point): Boolean =
         point.x > result.screenWidth * 0.78f &&
-            point.y > result.screenHeight * 0.045f &&
-            point.y < result.screenHeight * 0.12f
+            point.y > result.screenHeight * 0.035f &&
+            point.y < result.screenHeight * 0.14f
 
     private fun scheduleLandingGuard(service: GameAccessibilityService) {
         recoveryService = service
@@ -540,35 +522,28 @@ object AdAutoCloser {
         stopLandingGuard()
     }
 
-    private data class AccessibilityScan(
-        val closeNode: AccessibilityNodeInfo?,
-        val adEvidence: Boolean
-    )
+    private data class AccessibilityScan(val closeNode: AccessibilityNodeInfo?, val adEvidence: Boolean)
 
     private fun scanAccessibility(root: AccessibilityNodeInfo?): AccessibilityScan {
         root ?: return AccessibilityScan(null, false)
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
-        var adEvidence = false
+        var evidence = false
 
-        while (queue.isNotEmpty() && visited < 450) {
+        while (queue.isNotEmpty() && visited < 500) {
             val node = queue.removeFirst()
             visited++
             val label = nodeLabel(node)
-
             if (isAccessibilityCloseLabel(node, label)) return AccessibilityScan(node, true)
-            if (!adEvidence && isAdEvidenceLabel(label)) adEvidence = true
-
-            for (index in 0 until node.childCount) {
-                node.getChild(index)?.let(queue::addLast)
-            }
+            if (!evidence && isAdEvidenceLabel(label)) evidence = true
+            for (i in 0 until node.childCount) node.getChild(i)?.let(queue::addLast)
         }
-        return AccessibilityScan(null, adEvidence)
+        return AccessibilityScan(null, evidence)
     }
 
     private fun nodeLabel(node: AccessibilityNodeInfo): String = buildString {
-        node.text?.let { append(it) }
+        node.text?.let(::append)
         node.contentDescription?.let {
             if (isNotEmpty()) append(' ')
             append(it)
@@ -577,46 +552,32 @@ object AdAutoCloser {
 
     private fun isAdEvidenceLabel(label: String): Boolean {
         if (label.isBlank()) return false
-        return label.contains("install") ||
-            label.contains("download") ||
-            label.contains("google play") ||
-            label.contains("app store") ||
-            label.contains("sponsored") ||
-            label.contains("gesponsord") ||
-            label.contains("advertisement") ||
-            label.contains("advertentie") ||
-            label.contains("play now") ||
-            label.contains("speel nu") ||
-            label.contains("spin")
+        val markers = listOf(
+            "install", "download", "google play", "app store", "sponsored", "gesponsord",
+            "advertisement", "advertentie", "play now", "speel nu", "spin", "explore more",
+            "discover more", "learn more", "meer informatie", "visit site", "shop now",
+            "get started", "try now", "watch more", "read more", "sign up"
+        )
+        return markers.any(label::contains)
     }
 
     private fun isAccessibilityCloseLabel(node: AccessibilityNodeInfo, label: String): Boolean {
         if (label.isBlank()) return false
-        val looksClose = label == "sluiten" ||
-            label == "overslaan" ||
-            label == "skip" ||
-            label == "skip ad" ||
-            label == "dismiss" ||
-            label == "done" ||
-            label == "klaar" ||
-            label == "next" ||
+        val looksClose = label == "sluiten" || label == "overslaan" || label == "skip" ||
+            label == "skip ad" || label == "dismiss" || label == "done" || label == "klaar" ||
             label == "×" || label == "✕" || label == "✖" || label == "x" ||
-            label.contains("close ad") ||
-            label.contains("close button") ||
-            label.contains("ad sluiten") ||
-            label.contains("skip button") ||
+            label.contains("close ad") || label.contains("close button") ||
+            label.contains("ad sluiten") || label.contains("skip button") ||
             label.contains("fast forward")
         if (!looksClose) return false
 
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
+        val bounds = Rect().also(node::getBoundsInScreen)
         val root = node.window?.root ?: return false
         val rootBounds = Rect().also(root::getBoundsInScreen)
         if (rootBounds.width() <= 0 || rootBounds.height() <= 0) return false
 
-        return bounds.centerY() > rootBounds.top + rootBounds.height() * 0.045f &&
-            bounds.centerY() < rootBounds.top + rootBounds.height() * 0.12f &&
-            bounds.centerX() > rootBounds.left + rootBounds.width() * 0.78f
+        return bounds.centerX() > rootBounds.left + rootBounds.width() * 0.68f &&
+            bounds.centerY() < rootBounds.top + rootBounds.height() * 0.22f
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
@@ -624,21 +585,16 @@ object AdAutoCloser {
         repeat(3) {
             val candidate = current ?: return false
             val bounds = Rect().also(candidate::getBoundsInScreen)
-            val windowRoot = candidate.window?.root
+            val root = candidate.window?.root
             val rootBounds = Rect()
-            windowRoot?.getBoundsInScreen(rootBounds)
-
+            root?.getBoundsInScreen(rootBounds)
             val compact = rootBounds.width() > 0 && rootBounds.height() > 0 &&
                 bounds.width() <= rootBounds.width() * 0.30f &&
-                bounds.height() <= rootBounds.height() * 0.14f &&
-                bounds.centerX() > rootBounds.left + rootBounds.width() * 0.72f &&
-                bounds.centerY() < rootBounds.top + rootBounds.height() * 0.18f
+                bounds.height() <= rootBounds.height() * 0.16f
 
             if (compact && candidate.isClickable &&
                 candidate.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            ) {
-                return true
-            }
+            ) return true
             current = candidate.parent
         }
         return false

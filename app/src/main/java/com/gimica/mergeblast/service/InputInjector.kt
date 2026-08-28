@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.os.SystemClock
 import android.util.Log
+import com.gimica.mergeblast.config.BotConfig
 
 /**
  * Thin gesture-dispatch layer.
@@ -15,14 +16,29 @@ import android.util.Log
 class InputInjector(private val service: AccessibilityService) {
     companion object {
         private const val TAG = "InputInjector"
-        private const val TAP_DURATION_MS = 50L
-        private const val SWIPE_DURATION_MS = 260L
-        private const val MIN_TAP_INTERVAL_MS = 70L
-        private const val MIN_SWIPE_INTERVAL_MS = 120L
+        private const val DEFAULT_TAP_DURATION_MS = 50L
+        private const val DEFAULT_SWIPE_DURATION_MS = 260L
+        private const val DEFAULT_MIN_TAP_INTERVAL_MS = 70L
+        private const val DEFAULT_MIN_SWIPE_INTERVAL_MS = 120L
     }
+
+    private var tapDurationMs = DEFAULT_TAP_DURATION_MS
+    private var swipeDurationMs = DEFAULT_SWIPE_DURATION_MS
+    private var minTapIntervalMs = DEFAULT_MIN_TAP_INTERVAL_MS
+    private var minSwipeIntervalMs = DEFAULT_MIN_SWIPE_INTERVAL_MS
 
     private var lastTapTime = 0L
     private var lastSwipeTime = 0L
+
+    fun updateConfig(config: BotConfig) {
+        tapDurationMs = config.tapDurationMs.coerceIn(20L, 2_000L)
+        swipeDurationMs = config.swipeDurationMs.coerceIn(80L, 3_000L)
+
+        // BotConfig currently exposes one global move interval. Use a conservative fraction for
+        // gesture dispatch throttling; the DecisionEngine still enforces the full interval.
+        minTapIntervalMs = (config.minMoveIntervalMs / 2).coerceIn(30L, 1_000L)
+        minSwipeIntervalMs = config.minMoveIntervalMs.coerceIn(60L, 2_000L)
+    }
 
     fun performAction(decision: MoveDecision, board: BoardState): Boolean {
         return when (decision.action) {
@@ -57,12 +73,12 @@ class InputInjector(private val service: AccessibilityService) {
 
     fun performTap(x: Int, y: Int): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now - lastTapTime < MIN_TAP_INTERVAL_MS) return false
+        if (now - lastTapTime < minTapIntervalMs) return false
         lastTapTime = now
 
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val description = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, TAP_DURATION_MS))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, tapDurationMs))
             .build()
 
         return service.dispatchGesture(
@@ -85,10 +101,10 @@ class InputInjector(private val service: AccessibilityService) {
         fromY: Int,
         toX: Int,
         toY: Int,
-        durationMs: Long = SWIPE_DURATION_MS
+        durationMs: Long = swipeDurationMs
     ): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now - lastSwipeTime < MIN_SWIPE_INTERVAL_MS) return false
+        if (now - lastSwipeTime < minSwipeIntervalMs) return false
         lastSwipeTime = now
 
         if (fromX == toX && fromY == toY) {

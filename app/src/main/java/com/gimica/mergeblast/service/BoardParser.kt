@@ -13,8 +13,10 @@ class BoardParser {
     companion object {
         private const val TAG = "BoardParser"
         private const val DEFAULT_GRID_COLUMNS = 4
+        private const val MAX_REASONABLE_GRID_SIZE = 12
         private val NUMBER_PATTERN = Pattern.compile("^\\d+$")
         private val ANY_NUMBER_PATTERN = Pattern.compile("\\d+")
+        private val VALUE_PATTERN = Pattern.compile("(?i)value\\D*(\\d+)")
         private val TILE_CONTENT_DESC_PATTERN =
             Pattern.compile("(?i)tile.*\\d+|cell.*\\d+|number.*\\d+")
     }
@@ -38,13 +40,19 @@ class BoardParser {
             return null
         }
 
-        val tiles = tileNodes.mapNotNull { parseTile(it) }.filter { it.value > 0 }
-        if (tiles.isEmpty()) {
+        val parsedTiles = tileNodes.mapNotNull { parseTile(it) }.filter { it.value > 0 }
+        if (parsedTiles.isEmpty()) {
             Log.d(TAG, "No valid tiles parsed from ${tileNodes.size} candidates")
             return null
         }
 
+        val tiles = sanitizeTiles(parsedTiles) ?: return null
         val (gridRows, gridCols) = inferGridSize(tiles)
+        if (gridRows !in 1..MAX_REASONABLE_GRID_SIZE || gridCols !in 1..MAX_REASONABLE_GRID_SIZE) {
+            Log.w(TAG, "Rejecting unreasonable grid ${gridRows}x$gridCols")
+            return null
+        }
+
         val emptyCells = findEmptyCells(tiles, gridRows, gridCols)
         val score = extractScore(rootNode)
         val level = extractLevel(rootNode)
@@ -67,6 +75,32 @@ class BoardParser {
             "Parsed board: ${tiles.size} tiles, ${gridRows}x$gridCols, score=$score, level=$level, hash=$currentHash"
         )
         return board
+    }
+
+    /**
+     * Duplicate logical positions mean the hierarchy-to-grid mapping is ambiguous. A few nested
+     * duplicates can be collapsed safely; a mostly-collapsed board is rejected so the bot never
+     * acts on a fabricated 4x4 board full of false empty cells.
+     */
+    private fun sanitizeTiles(parsedTiles: List<Tile>): List<Tile>? {
+        val grouped = parsedTiles.groupBy { it.row to it.col }
+        val duplicateCount = parsedTiles.size - grouped.size
+
+        if (parsedTiles.size > 1 && grouped.size == 1) {
+            Log.w(TAG, "Rejecting board: all ${parsedTiles.size} tiles mapped to one cell")
+            return null
+        }
+
+        if (duplicateCount > max(2, parsedTiles.size / 3)) {
+            Log.w(TAG, "Rejecting board: $duplicateCount duplicate logical positions")
+            return null
+        }
+
+        return grouped.values.map { candidates ->
+            candidates.maxByOrNull { tile ->
+                tile.bounds.width().coerceAtLeast(1) * tile.bounds.height().coerceAtLeast(1)
+            }!!
+        }
     }
 
     /**
@@ -151,7 +185,7 @@ class BoardParser {
         val value = if (NUMBER_PATTERN.matcher(text).matches()) {
             text.toIntOrNull()
         } else {
-            extractNumbers(node.contentDescription?.toString().orEmpty()).firstOrNull()
+            extractTileValue(node.contentDescription?.toString().orEmpty())
         } ?: return null
 
         if (value <= 0) return null
@@ -167,6 +201,14 @@ class BoardParser {
             bounds = bounds,
             isMoving = isTileMoving(node)
         )
+    }
+
+    private fun extractTileValue(description: String): Int? {
+        val explicitValue = VALUE_PATTERN.matcher(description)
+        if (explicitValue.find()) {
+            return explicitValue.group(1)?.toIntOrNull()
+        }
+        return extractNumbers(description).firstOrNull()
     }
 
     /**
@@ -270,29 +312,21 @@ class BoardParser {
             node.extras?.getBoolean("isAnimating") == true ||
             node.extras?.getBoolean("isMoving") == true
 
-    private fun extractScore(root: AccessibilityNodeInfo): Int {
-        val node = findNodeWithText(root, "score", "points") ?: return 0
-        return extractNumbers(collectNodeText(node, maxDepth = 2)).firstOrNull() ?: 0
-    }
+    private fun extractScore(root: AccessibilityNodeInfo): Int =
+        findStructuredNumbers(root, setOf("score", "points"), maxDepth = 2, minNumbers = 1)
+            ?.firstOrNull() ?: 0
 
-    private fun extractLevel(root: AccessibilityNodeInfo): Int {
-        val node = findNodeWithText(root, "level", "stage", "wave") ?: return 1
-        return extractNumbers(collectNodeText(node, maxDepth = 2)).firstOrNull() ?: 1
-    }
+    private fun extractLevel(root: AccessibilityNodeInfo): Int =
+        findStructuredNumbers(root, setOf("level", "stage", "wave"), maxDepth = 2, minNumbers = 1)
+            ?.firstOrNull() ?: 1
 
     private fun extractMission(root: AccessibilityNodeInfo): MissionProgress? {
-        val missionNode = findNodeWithText(
+        val numbers = findStructuredNumbers(
             root,
-            "mission",
-            "objective",
-            "target",
-            "goal",
-            "task",
-            "quest"
+            setOf("mission", "objective", "target", "goal", "task", "quest"),
+            maxDepth = 3,
+            minNumbers = 2
         ) ?: return null
-
-        val numbers = extractNumbers(collectNodeText(missionNode, maxDepth = 3))
-        if (numbers.size < 2) return null
 
         return MissionProgress(
             mergeCountTarget = numbers[0],
@@ -300,6 +334,30 @@ class BoardParser {
             existAmountTarget = numbers.getOrNull(2) ?: 0,
             existAmountValue = numbers.getOrNull(3) ?: 0
         )
+    }
+
+    /**
+     * Search children first so the smallest subtree containing both a keyword and enough numbers
+     * wins. This avoids accidentally parsing the first tile number from an entire screen/root node.
+     */
+    private fun findStructuredNumbers(
+        node: AccessibilityNodeInfo,
+        keywords: Set<String>,
+        maxDepth: Int,
+        minNumbers: Int
+    ): List<Int>? {
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val childResult = findStructuredNumbers(child, keywords, maxDepth, minNumbers)
+            if (childResult != null) return childResult
+        }
+
+        val subtreeText = collectNodeText(node, maxDepth)
+        val lowercase = subtreeText.lowercase()
+        if (keywords.none { lowercase.contains(it) }) return null
+
+        val numbers = extractNumbers(subtreeText)
+        return numbers.takeIf { it.size >= minNumbers }
     }
 
     private fun extractNumbers(text: String): List<Int> {
@@ -330,25 +388,5 @@ class BoardParser {
             }
         }
         return parts.joinToString(" ")
-    }
-
-    private fun findNodeWithText(
-        root: AccessibilityNodeInfo,
-        vararg keywords: String
-    ): AccessibilityNodeInfo? {
-        val searchable = buildString {
-            append(root.text?.toString().orEmpty())
-            append(' ')
-            append(root.contentDescription?.toString().orEmpty())
-        }.lowercase()
-
-        if (keywords.any { searchable.contains(it.lowercase()) }) return root
-
-        for (i in 0 until root.childCount) {
-            val child = root.getChild(i) ?: continue
-            val found = findNodeWithText(child, *keywords)
-            if (found != null) return found
-        }
-        return null
     }
 }

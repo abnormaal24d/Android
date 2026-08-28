@@ -3,9 +3,12 @@ package com.gimica.mergeblast.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
+import android.graphics.Bitmap
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -28,6 +31,9 @@ class GameAccessibilityService : AccessibilityService() {
 
         private const val DEFAULT_TARGET_PACKAGE = "com.gimica.mergeblast"
         private const val MIN_VERIFY_TIMEOUT_MS = 650L
+        private const val VISION_CAPTURE_INTERVAL_MS = 450L
+        private const val VISION_VERIFY_TIMEOUT_MS = 1_400L
+        private const val VISION_STABLE_OBSERVATIONS = 2
 
         @Volatile
         private var activeInstance: GameAccessibilityService? = null
@@ -41,21 +47,36 @@ class GameAccessibilityService : AccessibilityService() {
     private val boardParser = BoardParser()
     private val decisionEngine = DecisionEngine()
     private val inputInjector = InputInjector(this)
+    private val screenBoardParser = ScreenBoardParser()
+    private val screenDecisionEngine = ScreenDecisionEngine(screenBoardParser)
     private val handler = Handler(Looper.getMainLooper())
     private val performanceMonitor = PerformanceMonitor()
 
     private val isBotRunning = AtomicBoolean(false)
     private val isProcessing = AtomicBoolean(false)
+    private val visionInFlight = AtomicBoolean(false)
     private val lastProcessTime = AtomicLong(0)
     private val stats = BotStats()
 
     private var pendingAction: PendingAction? = null
+    private var pendingVisionAction: PendingVisionAction? = null
+    private var useVisionMode = false
+    private var lastForegroundPackage: String? = null
+    private var lastVisionCaptureAt = 0L
+    private var lastVisionSignature: Int? = null
+    private var visionStableObservations = 0
 
     private data class PendingAction(
         val decision: MoveDecision,
         val beforeSignature: Int,
         val dispatchedAt: Long,
         val attempts: Int
+    )
+
+    private data class PendingVisionAction(
+        val move: ScreenMove,
+        val beforeSignature: Int,
+        val dispatchedAt: Long
     )
 
     private val tickRunnable = Runnable {
@@ -68,8 +89,13 @@ class GameAccessibilityService : AccessibilityService() {
         try {
             lastProcessTime.set(System.currentTimeMillis())
             val rootNode = rootInActiveWindow
-            if (rootNode != null && rootNode.packageName?.toString() == config.targetPackage) {
-                processGameEvent(rootNode)
+            val rootPackage = rootNode?.packageName?.toString()
+            if (rootPackage != null) lastForegroundPackage = rootPackage
+
+            if (rootPackage == config.targetPackage) {
+                if (useVisionMode) requestVisionCapture() else processGameEvent(rootNode)
+            } else if (rootNode == null && lastForegroundPackage == config.targetPackage && useVisionMode) {
+                requestVisionCapture()
             }
         } catch (t: Throwable) {
             DebugLogger.e("Bot tick failed", t)
@@ -124,8 +150,10 @@ class GameAccessibilityService : AccessibilityService() {
         val timer = performanceMonitor.startTimer("onAccessibilityEvent")
         try {
             val currentEvent = event ?: return
+            val packageName = currentEvent.packageName?.toString()
+            if (packageName != null) lastForegroundPackage = packageName
             if (!isBotRunning.get()) return
-            if (currentEvent.packageName?.toString() != config.targetPackage) return
+            if (packageName != config.targetPackage) return
 
             val now = System.currentTimeMillis()
             if (now - lastProcessTime.get() >= config.processIntervalMs) {
@@ -154,7 +182,21 @@ class GameAccessibilityService : AccessibilityService() {
                 boardParser.parseBoard(rootNode)
             } finally {
                 parseTimer.stop()
-            } ?: return
+            }
+
+            if (boardState == null) {
+                // Merge Blast renders the live board graphically on current versions. Once the
+                // hierarchy proves unusable, stay in visual mode for this bot session.
+                useVisionMode = true
+                pendingAction = null
+                decisionEngine.reset()
+                broadcastSimpleStatus(
+                    "Accessibility tiles unavailable; switching to screenshot OCR",
+                    "Vision mode starting"
+                )
+                requestVisionCapture()
+                return
+            }
 
             stats.updateBoard(boardState)
 
@@ -186,6 +228,134 @@ class GameAccessibilityService : AccessibilityService() {
             }
         } finally {
             timer.stop()
+        }
+    }
+
+    private fun requestVisionCapture() {
+        if (!isBotRunning.get() || !useVisionMode) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            broadcastSimpleStatus("Vision unavailable", "Screenshot capture requires Android 11+")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastVisionCaptureAt < VISION_CAPTURE_INTERVAL_MS) return
+        if (!visionInFlight.compareAndSet(false, true)) return
+        lastVisionCaptureAt = now
+
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            mainExecutor,
+            object : AccessibilityService.TakeScreenshotCallback {
+                override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+                    val hardwareBuffer = screenshot.hardwareBuffer
+                    val hardwareBitmap = try {
+                        Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
+                    } catch (t: Throwable) {
+                        null
+                    }
+                    val bitmap = try {
+                        hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                    } finally {
+                        hardwareBuffer.close()
+                    }
+
+                    if (bitmap == null) {
+                        visionInFlight.set(false)
+                        broadcastSimpleStatus("Vision screenshot failed", "Could not create bitmap")
+                        return
+                    }
+
+                    screenBoardParser.parse(
+                        bitmap,
+                        onSuccess = { state ->
+                            bitmap.recycle()
+                            visionInFlight.set(false)
+                            if (!isBotRunning.get() || !useVisionMode) return@parse
+                            if (state == null) {
+                                visionStableObservations = 0
+                                lastVisionSignature = null
+                                broadcastSimpleStatus(
+                                    "Vision active but board not recognized",
+                                    "Waiting for launcher/block numbers"
+                                )
+                            } else {
+                                handleVisionState(state)
+                            }
+                        },
+                        onFailure = { error ->
+                            bitmap.recycle()
+                            visionInFlight.set(false)
+                            DebugLogger.e("OCR failed", error)
+                            broadcastSimpleStatus("Vision OCR failed", error.message ?: "Unknown OCR error")
+                        }
+                    )
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    visionInFlight.set(false)
+                    DebugLogger.w("Screenshot failed with code $errorCode")
+                    broadcastSimpleStatus("Vision screenshot failed", "Android error code $errorCode")
+                }
+            }
+        )
+    }
+
+    private fun handleVisionState(state: ScreenGameState) {
+        if (rootInActiveWindow?.packageName?.toString() != config.targetPackage) return
+
+        stats.recordVisionBoard()
+        val signature = state.signature()
+        if (signature == lastVisionSignature) {
+            visionStableObservations++
+        } else {
+            lastVisionSignature = signature
+            visionStableObservations = 1
+        }
+
+        val pending = pendingVisionAction
+        if (pending != null) {
+            if (signature != pending.beforeSignature) {
+                pendingVisionAction = null
+                visionStableObservations = 1
+                stats.recordVisionAction(true)
+                broadcastVisionState(state, "Verified: ${pending.move.reasoning}")
+                return
+            }
+
+            val elapsed = System.currentTimeMillis() - pending.dispatchedAt
+            if (elapsed < VISION_VERIFY_TIMEOUT_MS) {
+                broadcastVisionState(state, "Waiting for shot result (${elapsed}ms)")
+                return
+            }
+
+            // Do not blindly repeat a vision tap: the game may have accepted the shot while OCR
+            // momentarily missed the changed launcher. Re-observe and make a fresh decision.
+            pendingVisionAction = null
+            visionStableObservations = 0
+            stats.recordVisionAction(false)
+            broadcastVisionState(state, "Shot not verified; re-reading board")
+            return
+        }
+
+        if (visionStableObservations < VISION_STABLE_OBSERVATIONS) {
+            broadcastVisionState(state, "Vision board detected; confirming stability")
+            return
+        }
+
+        val move = screenDecisionEngine.decide(state)
+        stats.recordVisionDecision()
+        val accepted = inputInjector.performTap(move.tapX, move.tapY)
+        if (accepted) {
+            pendingVisionAction = PendingVisionAction(
+                move = move,
+                beforeSignature = signature,
+                dispatchedAt = System.currentTimeMillis()
+            )
+            broadcastVisionState(state, "SHOT column ${move.column + 1}: ${move.reasoning}")
+        } else {
+            stats.recordVisionAction(false)
+            broadcastVisionState(state, "Shot dispatch rejected; ${move.reasoning}")
         }
     }
 
@@ -221,7 +391,6 @@ class GameAccessibilityService : AccessibilityService() {
             return true
         }
 
-        // maxRetries means retries after the initial attempt, not total attempts.
         val maxAttempts = 1 + config.maxRetries.coerceIn(0, 5)
         if (pending.attempts < maxAttempts) {
             val actionTimer = performanceMonitor.startTimer("retryAction")
@@ -237,9 +406,7 @@ class GameAccessibilityService : AccessibilityService() {
                     dispatchedAt = System.currentTimeMillis(),
                     attempts = nextAttempt
                 )
-                DebugLogger.w(
-                    "Action produced no board change; retry ${nextAttempt - 1}/${maxAttempts - 1}"
-                )
+                DebugLogger.w("Action produced no board change; retry ${nextAttempt - 1}/${maxAttempts - 1}")
                 broadcastState(board, MoveDecision.wait("Retrying unverified action"))
                 return true
             }
@@ -285,15 +452,14 @@ class GameAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         DebugLogger.w("Accessibility service interrupted; keeping bot state")
-        if (isBotRunning.get()) {
-            requestTick(config.processIntervalMs.coerceAtLeast(25L))
-        }
+        if (isBotRunning.get()) requestTick(config.processIntervalMs.coerceAtLeast(25L))
     }
 
     override fun onDestroy() {
         DebugLogger.w("Service destroyed")
         stopBot()
         handler.removeCallbacksAndMessages(null)
+        screenBoardParser.close()
         if (activeInstance === this) activeInstance = null
         DebugLogger.shutdown()
         super.onDestroy()
@@ -303,6 +469,11 @@ class GameAccessibilityService : AccessibilityService() {
         if (isBotRunning.getAndSet(true)) return
         decisionEngine.reset()
         pendingAction = null
+        pendingVisionAction = null
+        useVisionMode = false
+        visionStableObservations = 0
+        lastVisionSignature = null
+        lastVisionCaptureAt = 0L
         lastProcessTime.set(0L)
         stats.reset()
         performanceMonitor.reset()
@@ -314,8 +485,10 @@ class GameAccessibilityService : AccessibilityService() {
     fun stopBot() {
         if (!isBotRunning.getAndSet(false)) return
         pendingAction = null
+        pendingVisionAction = null
         handler.removeCallbacksAndMessages(null)
         isProcessing.set(false)
+        visionInFlight.set(false)
         DebugLogger.i("Bot stopped")
         broadcastBotState(false)
     }
@@ -349,12 +522,30 @@ class GameAccessibilityService : AccessibilityService() {
             putExtra(EXTRA_BOARD_STATE, board.toString())
             putExtra(EXTRA_DECISION, "${decision.action} - ${decision.reasoning}")
             putExtra(EXTRA_STATS, stats.toBundle())
-            putExtra(
-                EXTRA_PERFORMANCE,
-                performanceMonitor.getAllStats().joinToString("; ") { it.toString() }
-            )
+            putExtra(EXTRA_PERFORMANCE, performanceMonitor.getAllStats().joinToString("; ") { it.toString() })
         }
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
+
+    private fun broadcastVisionState(state: ScreenGameState, decision: String) {
+        val intent = Intent(ACTION_BOT_STATE_CHANGED).apply {
+            putExtra(EXTRA_BOT_RUNNING, isBotRunning.get())
+            putExtra(EXTRA_BOARD_STATE, state.summary())
+            putExtra(EXTRA_DECISION, decision)
+            putExtra(EXTRA_STATS, stats.toBundle())
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+        DebugLogger.d("${state.summary()} | $decision")
+    }
+
+    private fun broadcastSimpleStatus(board: String, decision: String) {
+        val intent = Intent(ACTION_BOT_STATE_CHANGED).apply {
+            putExtra(EXTRA_BOT_RUNNING, isBotRunning.get())
+            putExtra(EXTRA_BOARD_STATE, board)
+            putExtra(EXTRA_DECISION, decision)
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+        DebugLogger.d("$board | $decision")
     }
 
     private fun broadcastBotState(running: Boolean) {
@@ -377,19 +568,31 @@ class GameAccessibilityService : AccessibilityService() {
             boardsProcessed++
         }
 
+        fun recordVisionBoard() {
+            boardsProcessed++
+        }
+
         fun recordDecision(decision: MoveDecision) {
             if (decision.action != MoveDecision.Action.WAIT && decision.action != MoveDecision.Action.NONE) {
                 decisionsMade++
             }
         }
 
+        fun recordVisionDecision() {
+            decisionsMade++
+        }
+
         fun recordAction(success: Boolean, decision: MoveDecision? = null) {
             actionsExecuted++
             if (success) {
                 successfulActions++
-                // Current engine represents actual merge commands as TAP; SWIPE is repositioning.
                 if (decision?.action == MoveDecision.Action.TAP) verifiedMerges++
             }
+        }
+
+        fun recordVisionAction(success: Boolean) {
+            actionsExecuted++
+            if (success) successfulActions++
         }
 
         fun shouldLogPeriodic(): Boolean {

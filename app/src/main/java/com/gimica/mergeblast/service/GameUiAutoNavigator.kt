@@ -6,12 +6,15 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.os.SystemClock
 import com.google.mlkit.vision.text.Text
+import kotlin.math.abs
 
 /**
  * Handles non-board Merge Blast UI states using the OCR result we already paid for in
  * ScreenBoardParser. This keeps menu recovery essentially free: no second OCR pass is needed.
  *
  * Safety rules:
+ * - TAP TO PLAY is accepted only in the central game area together with a valid power-of-two
+ *   launcher near the bottom center.
  * - PAUSED screens only ever choose CONTINUE.
  * - HOME and TRY AGAIN are never tapped automatically.
  * - Main menu play is inferred only from multiple game-menu markers, then tapped at the known
@@ -19,6 +22,7 @@ import com.google.mlkit.vision.text.Text
  */
 object GameUiAutoNavigator {
     private const val ACTION_COOLDOWN_MS = 520L
+    private const val START_COOLDOWN_MS = 360L
     private const val TAP_DURATION_MS = 20L
 
     private const val MAIN_PLAY_X = 0.50f
@@ -27,7 +31,7 @@ object GameUiAutoNavigator {
     private var lastActionAt = 0L
     private var lastActionKind: ActionKind? = null
 
-    private enum class ActionKind { CONTINUE, PLAY }
+    private enum class ActionKind { START_GAME, CONTINUE, PLAY }
 
     /**
      * @return a status string when a known game UI is recognized, null when this is not a known
@@ -71,6 +75,34 @@ object GameUiAutoNavigator {
         }
 
         val all = normalizedAll.toString()
+
+        // In-level start gate: an empty/new round displays "Tap to Play" while a numbered launcher
+        // is already visible at the bottom. Tap the OCR phrase itself, not a guessed board cell.
+        // Requiring the launcher position/value prevents similarly worded ad creatives from being
+        // mistaken for the game start gate.
+        val tapToPlay = labels.firstOrNull { element ->
+            isTapToPlayLabel(element.label) &&
+                element.bounds.centerX() in (screenWidth * 0.22f).toInt()..(screenWidth * 0.78f).toInt() &&
+                element.bounds.centerY() in (screenHeight * 0.32f).toInt()..(screenHeight * 0.62f).toInt()
+        }
+        val hasLauncher = labels.any { element ->
+            val value = element.label.replace(" ", "").toIntOrNull() ?: return@any false
+            isPowerOfTwo(value) &&
+                element.bounds.centerY() in (screenHeight * 0.68f).toInt()..(screenHeight * 0.86f).toInt() &&
+                abs(element.bounds.centerX() - screenWidth / 2) <= screenWidth * 0.20f
+        }
+
+        if (tapToPlay != null && hasLauncher) {
+            return dispatchWithCooldown(
+                kind = ActionKind.START_GAME,
+                service = service,
+                x = tapToPlay.bounds.centerX(),
+                y = tapToPlay.bounds.centerY(),
+                successText = "TAP TO PLAY herkend; spel gestart",
+                waitingText = "TAP TO PLAY reeds aangetikt; wachten op eerste blok",
+                cooldownMs = START_COOLDOWN_MS
+            )
+        }
 
         // Pause dialog: require strong context and click the actual OCR bounding box of CONTINUE.
         val isPaused = containsWord(all, "paused") &&
@@ -131,10 +163,11 @@ object GameUiAutoNavigator {
         x: Int,
         y: Int,
         successText: String,
-        waitingText: String
+        waitingText: String,
+        cooldownMs: Long = ACTION_COOLDOWN_MS
     ): String {
         val now = SystemClock.uptimeMillis()
-        if (lastActionKind == kind && now - lastActionAt < ACTION_COOLDOWN_MS) {
+        if (lastActionKind == kind && now - lastActionAt < cooldownMs) {
             return waitingText
         }
 
@@ -157,6 +190,16 @@ object GameUiAutoNavigator {
             .build()
         return service.dispatchGesture(gesture, null, null)
     }
+
+    private fun isTapToPlayLabel(label: String): Boolean {
+        val compact = label.replace(" ", "")
+        return label == "tap to play" ||
+            label.contains("tap to play") ||
+            compact == "taptoplay"
+    }
+
+    private fun isPowerOfTwo(value: Int): Boolean =
+        value >= 2 && value <= (1 shl 20) && value and (value - 1) == 0
 
     private fun isContinueLabel(label: String): Boolean =
         label == "continue" ||

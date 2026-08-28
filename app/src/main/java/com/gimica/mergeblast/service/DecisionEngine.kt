@@ -1,6 +1,7 @@
 package com.gimica.mergeblast.service
 
 import android.util.Log
+import com.gimica.mergeblast.config.BotConfig
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -17,7 +18,7 @@ class DecisionEngine {
     private var lastMoveTime = 0L
     private var consecutiveWaits = 0
     private val moveHistory = mutableListOf<MoveRecord>()
-    private val config = EngineConfig()
+    private var config = EngineConfig()
 
     data class EngineConfig(
         val mergeWeight: Int = 100,
@@ -28,6 +29,7 @@ class DecisionEngine {
         val cornerBonus: Int = 20,
         val monotonicityWeight: Int = 30,
         val smoothnessWeight: Int = 20,
+        val enableLookahead: Boolean = true,
         val maxDepth: Int = MAX_LOOKAHEAD_DEPTH,
         val minMoveInterval: Long = 150
     )
@@ -39,29 +41,45 @@ class DecisionEngine {
         val timestamp: Long = System.currentTimeMillis()
     )
 
+    fun updateConfig(botConfig: BotConfig) {
+        config = EngineConfig(
+            mergeWeight = botConfig.mergeWeight,
+            chainBonus = botConfig.chainBonus,
+            spaceWeight = botConfig.spaceWeight,
+            missionWeight = botConfig.missionWeight,
+            highValueBonus = botConfig.highValueBonus,
+            cornerBonus = botConfig.cornerBonus,
+            monotonicityWeight = botConfig.monotonicityWeight,
+            smoothnessWeight = botConfig.smoothnessWeight,
+            enableLookahead = botConfig.enableLookahead,
+            maxDepth = botConfig.lookaheadDepth.coerceIn(0, MAX_LOOKAHEAD_DEPTH),
+            minMoveInterval = botConfig.minMoveIntervalMs.coerceAtLeast(0L)
+        )
+    }
+
     fun decideMove(board: BoardState): MoveDecision {
         if (!board.isStable()) {
             return MoveDecision.wait("Board animation detected")
         }
 
-        val currentHash = board.signature()
+        if (isMissionComplete(board)) {
+            Log.d(TAG, "Mission complete!")
+            return MoveDecision.none("Mission complete")
+        }
 
+        val currentHash = board.signature()
         if (currentHash == lastBoardHash) {
             stuckCounter++
             consecutiveWaits++
-            if (stuckCounter > 5) {
-                Log.w(TAG, "Board stuck for $stuckCounter cycles, forcing exploratory move")
+            val lastAttemptWasOnThisBoard = moveHistory.lastOrNull()?.boardHash == currentHash
+            if (stuckCounter > 5 && lastAttemptWasOnThisBoard) {
+                Log.w(TAG, "Board stuck after attempted moves for $stuckCounter cycles, forcing exploratory move")
                 return findExploratoryMove(board)
             }
         } else {
             stuckCounter = 0
             consecutiveWaits = 0
             lastBoardHash = currentHash
-        }
-
-        if (board.missionProgress?.isComplete() == true) {
-            Log.d(TAG, "Mission complete!")
-            return MoveDecision.none("Mission complete")
         }
 
         val now = System.currentTimeMillis()
@@ -114,6 +132,8 @@ class DecisionEngine {
     }
 
     private fun adaptiveLookaheadDepth(board: BoardState): Int {
+        if (!config.enableLookahead || config.maxDepth <= 0) return 0
+
         val capacity = (board.gridRows * board.gridCols).coerceAtLeast(1)
         val emptyRatio = board.emptyCells.size.toFloat() / capacity
         return when {
@@ -166,7 +186,13 @@ class DecisionEngine {
 
         val mission = board.missionProgress
         if (mission != null) {
-            if (mission.existAmountTarget > 0 && newValue >= mission.existAmountValue) {
+            val existingTargetTiles = missionExistCount(board, mission)
+            if (
+                mission.existAmountTarget > 0 &&
+                existingTargetTiles < mission.existAmountTarget &&
+                mission.existAmountValue > 0 &&
+                newValue >= mission.existAmountValue
+            ) {
                 score += config.missionWeight * 5
             }
             if (mission.mergeCountTarget > 0 && mission.mergeCountCurrent < mission.mergeCountTarget) {
@@ -317,22 +343,40 @@ class DecisionEngine {
 
     private fun hasMissionTarget(board: BoardState): Boolean {
         val mission = board.missionProgress ?: return false
-        return mission.mergeCountTarget > 0 || mission.existAmountTarget > 0
+        val mergeIncomplete = mission.mergeCountTarget > 0 && mission.mergeCountCurrent < mission.mergeCountTarget
+        val existIncomplete = mission.existAmountTarget > 0 &&
+            missionExistCount(board, mission) < mission.existAmountTarget
+        return mergeIncomplete || existIncomplete
+    }
+
+    private fun isMissionComplete(board: BoardState): Boolean {
+        val mission = board.missionProgress ?: return false
+        val mergeDone = mission.mergeCountTarget <= 0 || mission.mergeCountCurrent >= mission.mergeCountTarget
+        val existDone = mission.existAmountTarget <= 0 ||
+            missionExistCount(board, mission) >= mission.existAmountTarget
+        return mergeDone && existDone
+    }
+
+    private fun missionExistCount(board: BoardState, mission: MissionProgress): Int {
+        if (mission.existAmountTarget <= 0) return 0
+        if (mission.existAmountValue <= 0) return 0
+        return board.tiles.count { it.value >= mission.existAmountValue }
     }
 
     private fun findMissionMove(board: BoardState): MoveDecision {
-        val mission = board.missionProgress!!
+        val mission = board.missionProgress ?: return findStrategicMove(board)
 
-        if (mission.existAmountTarget > 0) {
-            val targetTiles = board.tiles.filter { it.value >= mission.existAmountValue }
-            if (targetTiles.isNotEmpty()) {
-                val best = targetTiles.maxByOrNull { it.value }!!
-                return MoveDecision.tap(best, "Mission: build ${mission.existAmountValue}+ tile")
-                    .copy(confidence = 0.9f)
-            }
+        val existCount = missionExistCount(board, mission)
+        if (mission.existAmountTarget > 0 && existCount < mission.existAmountTarget) {
+            // There is no immediate merge (those are handled before this method). Do not tap an
+            // already-good tile; reposition instead so a future merge can build the missing target.
+            val strategic = findStrategicMove(board)
+            return strategic.copy(
+                reasoning = "Mission build ${mission.existAmountTarget}x ${mission.existAmountValue}+: ${strategic.reasoning}"
+            )
         }
 
-        if (mission.mergeCountCurrent < mission.mergeCountTarget) {
+        if (mission.mergeCountTarget > 0 && mission.mergeCountCurrent < mission.mergeCountTarget) {
             val pairs = board.getMergeablePairs()
             val best = pairs.maxByOrNull { (t1, t2) -> evaluateMergeImmediate(t1, t2, board) }
             best?.let { (t1, _) ->
@@ -343,7 +387,7 @@ class DecisionEngine {
             }
         }
 
-        return MoveDecision.wait("Waiting for mission opportunity")
+        return findStrategicMove(board)
     }
 
     private fun shouldCreateSpace(board: BoardState): Boolean =

@@ -72,6 +72,7 @@ class ScreenBoardParser {
                 )
 
                 if (state != null) {
+                    GameUiAutoNavigator.onBoardVisible()
                     AdAutoCloser.onGameVisible()
                     onSuccess(state)
                     return@addOnSuccessListener
@@ -79,6 +80,22 @@ class ScreenBoardParser {
 
                 val service = GameAccessibilityService.getInstance()
                 if (service == null) {
+                    onSuccess(null)
+                    return@addOnSuccessListener
+                }
+
+                // Reuse the gameplay OCR result to recover known Merge Blast UI states before any
+                // ad handling. PAUSED -> CONTINUE, main menu -> central PLAY button. This costs no
+                // extra OCR pass and prevents HOME / TRY AGAIN from ever being chosen automatically.
+                val uiStatus = GameUiAutoNavigator.handle(
+                    text = result,
+                    screenWidth = bitmap.width,
+                    screenHeight = bitmap.height,
+                    xOffset = cropLeft,
+                    yOffset = cropTop,
+                    service = service
+                )
+                if (uiStatus != null) {
                     onSuccess(null)
                     return@addOnSuccessListener
                 }
@@ -91,7 +108,7 @@ class ScreenBoardParser {
                     return@addOnSuccessListener
                 }
 
-                // Only if the cheap path has no evidence, OCR the top+bottom ad control strips.
+                // Only if the cheap paths have no evidence, OCR the top+bottom ad control strips.
                 adScreenDetector.inspect(
                     bitmap,
                     onSuccess = { adResult ->

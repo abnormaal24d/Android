@@ -8,7 +8,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.gimica.mergeblast"
+        applicationId = "com.gimica.mergeblast.autoplayer"
         minSdk = 29
         targetSdk = 35
         versionCode = 1
@@ -69,4 +69,3 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
-

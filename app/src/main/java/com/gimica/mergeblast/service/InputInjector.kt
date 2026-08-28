@@ -33,9 +33,6 @@ class InputInjector(private val service: AccessibilityService) {
     fun updateConfig(config: BotConfig) {
         tapDurationMs = config.tapDurationMs.coerceIn(20L, 2_000L)
         swipeDurationMs = config.swipeDurationMs.coerceIn(80L, 3_000L)
-
-        // BotConfig currently exposes one global move interval. Use a conservative fraction for
-        // gesture dispatch throttling; the DecisionEngine still enforces the full interval.
         minTapIntervalMs = (config.minMoveIntervalMs / 2).coerceIn(30L, 1_000L)
         minSwipeIntervalMs = config.minMoveIntervalMs.coerceIn(60L, 2_000L)
     }
@@ -73,15 +70,18 @@ class InputInjector(private val service: AccessibilityService) {
 
     fun performTap(x: Int, y: Int): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now - lastTapTime < minTapIntervalMs) return false
-        lastTapTime = now
+        val elapsed = now - lastTapTime
+        if (elapsed < minTapIntervalMs) {
+            Log.d(TAG, "Tap throttled: ${minTapIntervalMs - elapsed}ms remaining")
+            return false
+        }
 
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val description = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, tapDurationMs))
             .build()
 
-        return service.dispatchGesture(
+        val accepted = service.dispatchGesture(
             description,
             object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription) {
@@ -94,6 +94,8 @@ class InputInjector(private val service: AccessibilityService) {
             },
             null
         )
+        if (accepted) lastTapTime = now
+        return accepted
     }
 
     fun performSwipe(
@@ -103,12 +105,15 @@ class InputInjector(private val service: AccessibilityService) {
         toY: Int,
         durationMs: Long = swipeDurationMs
     ): Boolean {
-        val now = SystemClock.uptimeMillis()
-        if (now - lastSwipeTime < minSwipeIntervalMs) return false
-        lastSwipeTime = now
-
         if (fromX == toX && fromY == toY) {
             Log.w(TAG, "Ignoring zero-length swipe at ($fromX,$fromY)")
+            return false
+        }
+
+        val now = SystemClock.uptimeMillis()
+        val elapsed = now - lastSwipeTime
+        if (elapsed < minSwipeIntervalMs) {
+            Log.d(TAG, "Swipe throttled: ${minSwipeIntervalMs - elapsed}ms remaining")
             return false
         }
 
@@ -120,7 +125,7 @@ class InputInjector(private val service: AccessibilityService) {
             .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs.coerceAtLeast(80L)))
             .build()
 
-        return service.dispatchGesture(
+        val accepted = service.dispatchGesture(
             description,
             object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription) {
@@ -133,5 +138,7 @@ class InputInjector(private val service: AccessibilityService) {
             },
             null
         )
+        if (accepted) lastSwipeTime = now
+        return accepted
     }
 }

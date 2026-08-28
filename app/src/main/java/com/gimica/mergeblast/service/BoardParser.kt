@@ -3,22 +3,24 @@ package com.gimica.mergeblast.service
 import android.graphics.Rect
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
-import com.gimica.mergeblast.service.BoardState
-import com.gimica.mergeblast.service.Tile
-import com.gimica.mergeblast.service.MissionProgress
-import kotlin.math.max
 import java.util.regex.Pattern
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 class BoardParser {
     companion object {
         private const val TAG = "BoardParser"
+        private const val DEFAULT_GRID_COLUMNS = 4
         private val NUMBER_PATTERN = Pattern.compile("^\\d+$")
-        private val TILE_CONTENT_DESC_PATTERN = Pattern.compile("(?i)tile.*\\d+|cell.*\\d+|number.*\\d+")
+        private val ANY_NUMBER_PATTERN = Pattern.compile("\\d+")
+        private val TILE_CONTENT_DESC_PATTERN =
+            Pattern.compile("(?i)tile.*\\d+|cell.*\\d+|number.*\\d+")
     }
 
     private var lastBoardHash = 0
     private var cachedBoard: BoardState? = null
-    private val nodeCache = mutableMapOf<Int, AccessibilityNodeInfo>()
 
     fun parseBoard(rootNode: AccessibilityNodeInfo?): BoardState? {
         rootNode ?: return null
@@ -28,7 +30,6 @@ class BoardParser {
             return cachedBoard
         }
 
-        clearCache()
         val tileNodes = mutableListOf<AccessibilityNodeInfo>()
         collectTileCandidates(rootNode, tileNodes)
 
@@ -61,118 +62,176 @@ class BoardParser {
 
         lastBoardHash = currentHash
         cachedBoard = board
-        Log.d(TAG, "Parsed board: ${tiles.size} tiles, ${gridRows}x$gridCols, score=$score, level=$level, hash=$currentHash")
+        Log.d(
+            TAG,
+            "Parsed board: ${tiles.size} tiles, ${gridRows}x$gridCols, score=$score, level=$level, hash=$currentHash"
+        )
         return board
     }
 
+    /**
+     * Hash every property that can materially change the parsed game state. In particular,
+     * contentDescription must participate because some games expose tile values only there.
+     */
     private fun computeTreeHash(node: AccessibilityNodeInfo): Int {
-        var hash = node.className.hashCode() * 31 + node.text.hashCode()
+        var hash = 17
+        hash = hash * 31 + node.className.hashCode()
+        hash = hash * 31 + node.text.hashCode()
+        hash = hash * 31 + node.contentDescription.hashCode()
+        hash = hash * 31 + node.viewIdResourceName.hashCode()
+        hash = hash * 31 + node.childCount
+        hash = hash * 31 + if (node.isSelected) 1 else 0
+        hash = hash * 31 + if (node.isContentInvalid) 1 else 0
+
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         hash = hash * 31 + bounds.hashCode()
+
         for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { hash = hash * 31 + computeTreeHash(it) }
+            node.getChild(i)?.let { child ->
+                hash = hash * 31 + computeTreeHash(child)
+            }
         }
         return hash
     }
 
-    private fun clearCache() {
-        nodeCache.values.forEach { it.recycle() }
-        nodeCache.clear()
-    }
-
-    private fun collectTileCandidates(node: AccessibilityNodeInfo, result: MutableList<AccessibilityNodeInfo>) {
+    private fun collectTileCandidates(
+        node: AccessibilityNodeInfo,
+        result: MutableList<AccessibilityNodeInfo>
+    ) {
         if (isTileCandidate(node)) {
             result.add(node)
-        } else {
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { collectTileCandidates(it, result) }
-            }
+            return
+        }
+
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { collectTileCandidates(it, result) }
         }
     }
 
     private fun isTileCandidate(node: AccessibilityNodeInfo): Boolean {
-        val className = node.className.toString().lowercase()
-        val text = node.text?.toString() ?: ""
-        val contentDesc = node.contentDescription?.toString() ?: ""
-        val viewId = node.viewIdResourceName?.toString() ?: ""
+        val className = node.className?.toString()?.lowercase().orEmpty()
+        val text = node.text?.toString().orEmpty()
+        val contentDesc = node.contentDescription?.toString().orEmpty()
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
 
         val hasNumberText = NUMBER_PATTERN.matcher(text).matches()
         val hasNumberContentDesc = TILE_CONTENT_DESC_PATTERN.matcher(contentDesc).matches()
-        val hasNumberInId = viewId.contains("tile") || viewId.contains("cell") || viewId.contains("number")
+        val hasNumberInId = viewId.contains("tile") ||
+            viewId.contains("cell") ||
+            viewId.contains("number") ||
+            viewId.contains("block") ||
+            viewId.contains("piece")
 
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
-        val hasValidBounds = bounds.width() > 0 && bounds.height() > 0 &&
-                            bounds.width() < 500 && bounds.height() < 500
+        val hasValidBounds = bounds.width() > 0 &&
+            bounds.height() > 0 &&
+            bounds.width() < 500 &&
+            bounds.height() < 500
 
-        val isTileLikeClass = className.contains("textview") || className.contains("button") ||
-                              className.contains("imageview") || className.contains("view")
+        val isTileLikeClass = className.contains("textview") ||
+            className.contains("button") ||
+            className.contains("imageview") ||
+            className.contains("view") ||
+            className.contains("framelayout")
 
-        val isInteractive = node.isClickable || node.isFocusable || node.isLongClickable ||
-                           node.isSelected || node.isEnabled
+        val isInteractive = node.isClickable ||
+            node.isFocusable ||
+            node.isLongClickable ||
+            node.isSelected
 
-        return hasValidBounds && (hasNumberText || hasNumberContentDesc || hasNumberInId) &&
-               (isTileLikeClass || isInteractive)
+        return hasValidBounds &&
+            (hasNumberText || hasNumberContentDesc || hasNumberInId) &&
+            (isTileLikeClass || isInteractive)
     }
 
     private fun parseTile(node: AccessibilityNodeInfo): Tile? {
-        val text = node.text?.toString() ?: ""
+        val text = node.text?.toString().orEmpty()
         val value = if (NUMBER_PATTERN.matcher(text).matches()) {
             text.toIntOrNull()
         } else {
-            extractNumberFromContentDesc(node.contentDescription?.toString() ?: "")
-        }
-        value?.let { if (it <= 0) return null } ?: return null
+            extractNumbers(node.contentDescription?.toString().orEmpty()).firstOrNull()
+        } ?: return null
+
+        if (value <= 0) return null
 
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
-
-        val (row, col) = estimateGridPosition(node, bounds)
+        val (row, col) = estimateGridPosition(node)
 
         return Tile(
             row = row,
             col = col,
-            value = value!!,
+            value = value,
             bounds = bounds,
             isMoving = isTileMoving(node)
         )
     }
 
-    private fun extractNumberFromContentDesc(desc: String): Int? {
-        val matcher = Pattern.compile("\\d+").matcher(desc)
-        return if (matcher.find()) matcher.group().toIntOrNull() else null
-    }
-
-    private fun estimateGridPosition(node: AccessibilityNodeInfo, bounds: Rect): Pair<Int, Int> {
+    /**
+     * Prefer hierarchy indices because they preserve empty cells. Flat Grid/Recycler containers
+     * are translated from child index to row/column instead of treating every child as a new row.
+     */
+    private fun estimateGridPosition(node: AccessibilityNodeInfo): Pair<Int, Int> {
         var currentNode: AccessibilityNodeInfo? = node
         var parent = currentNode?.parent
-        var row = 0
-        var col = 0
+        var row: Int? = null
+        var col: Int? = null
         var depth = 0
 
-        while (parent != null && depth < 10) {
-            val index = findChildIndex(parent, currentNode!!)
+        while (parent != null && currentNode != null && depth < 10) {
+            val index = findChildIndex(parent, currentNode)
             if (index >= 0) {
-                val parentClass = parent.className.toString().lowercase()
-                val parentId = parent.viewIdResourceName?.toString()?.lowercase() ?: ""
-                val isGrid = parentClass.contains("grid") || parentId.contains("grid") ||
-                             parentClass.contains("recyclerview") || parentClass.contains("table")
-                val isLinearVertical = parentClass.contains("linearlayout") &&
-                    getOrientation(parent) == 1
+                val parentClass = parent.className?.toString()?.lowercase().orEmpty()
+                val parentId = parent.viewIdResourceName?.lowercase().orEmpty()
+                val isGrid = parentClass.contains("grid") ||
+                    parentId.contains("grid") ||
+                    parentClass.contains("recyclerview") ||
+                    parentClass.contains("table")
 
-                if (isGrid || isLinearVertical) {
-                    row = index
-                } else if (parentClass.contains("linearlayout")) {
-                    col = index
+                if (isGrid) {
+                    val columns = inferColumnCount(parent)
+                    return (index / columns) to (index % columns)
+                }
+
+                if (parentClass.contains("linearlayout")) {
+                    if (inferLinearOrientation(parent) == 1) {
+                        if (row == null) row = index
+                    } else if (col == null) {
+                        col = index
+                    }
                 }
             }
+
             currentNode = parent
-            parent = currentNode?.parent
+            parent = currentNode.parent
             depth++
         }
 
-        return row to col
+        return (row ?: 0) to (col ?: 0)
+    }
+
+    private fun inferColumnCount(parent: AccessibilityNodeInfo): Int {
+        val count = parent.childCount.coerceAtLeast(1)
+        val square = sqrt(count.toDouble()).roundToInt()
+        if (square >= 2 && square * square == count) return square
+        return if (count >= DEFAULT_GRID_COLUMNS) DEFAULT_GRID_COLUMNS else count
+    }
+
+    /** 0 = horizontal, 1 = vertical. */
+    private fun inferLinearOrientation(parent: AccessibilityNodeInfo): Int {
+        if (parent.childCount < 2) return 0
+        val first = parent.getChild(0) ?: return 0
+        val second = parent.getChild(1) ?: return 0
+        val firstBounds = Rect()
+        val secondBounds = Rect()
+        first.getBoundsInScreen(firstBounds)
+        second.getBoundsInScreen(secondBounds)
+
+        val dx = abs(secondBounds.centerX() - firstBounds.centerX())
+        val dy = abs(secondBounds.centerY() - firstBounds.centerY())
+        return if (dy > dx) 1 else 0
     }
 
     private fun findChildIndex(parent: AccessibilityNodeInfo, child: AccessibilityNodeInfo): Int {
@@ -182,77 +241,112 @@ class BoardParser {
         return -1
     }
 
-    private fun getOrientation(node: AccessibilityNodeInfo): Int {
-        try {
-            val clazz = Class.forName(node.className.toString())
-            val field = clazz.getDeclaredField("mOrientation")
-            field.isAccessible = true
-            return field.getInt(node)
-        } catch (e: Exception) {
-            return 0
-        }
-    }
-
     private fun inferGridSize(tiles: List<Tile>): Pair<Int, Int> {
         if (tiles.isEmpty()) return 4 to 4
 
         val rows = tiles.map { it.row }.distinct().sorted()
         val cols = tiles.map { it.col }.distinct().sorted()
-
         val inferredRows = if (rows.size > 1) rows.last() + 1 else 4
         val inferredCols = if (cols.size > 1) cols.last() + 1 else 4
 
         return max(inferredRows, 4) to max(inferredCols, 4)
     }
 
-    private fun findEmptyCells(tiles: List<Tile>, rows: Int, cols: Int): List<Pair<Int, Int>> {
+    private fun findEmptyCells(
+        tiles: List<Tile>,
+        rows: Int,
+        cols: Int
+    ): List<Pair<Int, Int>> {
         val occupied = tiles.map { it.row to it.col }.toSet()
-        return (0 until rows).flatMap { r ->
-            (0 until cols).map { c -> r to c }.filterNot { occupied.contains(it) }
+        return (0 until rows).flatMap { row ->
+            (0 until cols).mapNotNull { col ->
+                (row to col).takeUnless { it in occupied }
+            }
         }
     }
 
-    private fun isTileMoving(node: AccessibilityNodeInfo): Boolean {
-        return node.isContentInvalid ||
-               node.getExtras()?.getBoolean("isAnimating") == true ||
-               node.getExtras()?.getBoolean("isMoving") == true
-    }
+    private fun isTileMoving(node: AccessibilityNodeInfo): Boolean =
+        node.isContentInvalid ||
+            node.extras?.getBoolean("isAnimating") == true ||
+            node.extras?.getBoolean("isMoving") == true
 
     private fun extractScore(root: AccessibilityNodeInfo): Int {
-        return findNodeWithText(root, "score", "Score", "SCORE", "points", "Points")?.text.toString()
-            ?.let { NUMBER_PATTERN.matcher(it).results().map { it.group().toInt() }.toList().firstOrNull() } ?: 0
+        val node = findNodeWithText(root, "score", "points") ?: return 0
+        return extractNumbers(collectNodeText(node, maxDepth = 2)).firstOrNull() ?: 0
     }
 
     private fun extractLevel(root: AccessibilityNodeInfo): Int {
-        return findNodeWithText(root, "level", "Level", "LEVEL", "stage", "Stage", "wave", "Wave")?.text.toString()
-            ?.let { NUMBER_PATTERN.matcher(it).results().map { it.group().toInt() }.toList().firstOrNull() } ?: 1
+        val node = findNodeWithText(root, "level", "stage", "wave") ?: return 1
+        return extractNumbers(collectNodeText(node, maxDepth = 2)).firstOrNull() ?: 1
     }
 
     private fun extractMission(root: AccessibilityNodeInfo): MissionProgress? {
-        val missionNode = findNodeWithText(root, "mission", "Mission", "objective", "Objective", "target", "Target",
-            "goal", "Goal", "task", "Task")
-        missionNode?.let {
-            val text = it.text.toString()
-            val numbers = NUMBER_PATTERN.matcher(text).results().map { it.group().toInt() }.toList()
-            if (numbers.size >= 2) {
-                return MissionProgress(
-                    mergeCountTarget = numbers[0],
-                    mergeCountCurrent = numbers[1],
-                    existAmountTarget = numbers.getOrNull(2) ?: 0,
-                    existAmountValue = numbers.getOrNull(3) ?: 0
-                )
-            }
-        }
-        return null
+        val missionNode = findNodeWithText(
+            root,
+            "mission",
+            "objective",
+            "target",
+            "goal",
+            "task",
+            "quest"
+        ) ?: return null
+
+        val numbers = extractNumbers(collectNodeText(missionNode, maxDepth = 3))
+        if (numbers.size < 2) return null
+
+        return MissionProgress(
+            mergeCountTarget = numbers[0],
+            mergeCountCurrent = numbers[1],
+            existAmountTarget = numbers.getOrNull(2) ?: 0,
+            existAmountValue = numbers.getOrNull(3) ?: 0
+        )
     }
 
-    private fun findNodeWithText(root: AccessibilityNodeInfo, vararg keywords: String): AccessibilityNodeInfo? {
-        val text = root.text?.toString()?.lowercase() ?: ""
-        if (keywords.any { text.contains(it.lowercase()) }) {
-            return root
+    private fun extractNumbers(text: String): List<Int> {
+        val matcher = ANY_NUMBER_PATTERN.matcher(text)
+        val values = mutableListOf<Int>()
+        while (matcher.find()) {
+            matcher.group()?.toIntOrNull()?.let(values::add)
         }
+        return values
+    }
+
+    private fun collectNodeText(
+        node: AccessibilityNodeInfo,
+        maxDepth: Int,
+        depth: Int = 0
+    ): String {
+        val parts = mutableListOf<String>()
+        node.text?.toString()?.takeIf { it.isNotBlank() }?.let(parts::add)
+        node.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let(parts::add)
+
+        if (depth < maxDepth) {
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { child ->
+                    collectNodeText(child, maxDepth, depth + 1)
+                        .takeIf { it.isNotBlank() }
+                        ?.let(parts::add)
+                }
+            }
+        }
+        return parts.joinToString(" ")
+    }
+
+    private fun findNodeWithText(
+        root: AccessibilityNodeInfo,
+        vararg keywords: String
+    ): AccessibilityNodeInfo? {
+        val searchable = buildString {
+            append(root.text?.toString().orEmpty())
+            append(' ')
+            append(root.contentDescription?.toString().orEmpty())
+        }.lowercase()
+
+        if (keywords.any { searchable.contains(it.lowercase()) }) return root
+
         for (i in 0 until root.childCount) {
-            val found = findNodeWithText(root.getChild(i)!!, *keywords)
+            val child = root.getChild(i) ?: continue
+            val found = findNodeWithText(child, *keywords)
             if (found != null) return found
         }
         return null

@@ -27,7 +27,8 @@ class GameAccessibilityService : AccessibilityService() {
         const val EXTRA_PERFORMANCE = "performance"
 
         private const val DEFAULT_TARGET_PACKAGE = "com.gimica.mergeblast"
-        private const val MAX_EVENT_QUEUE_SIZE = 10
+        private const val MIN_VERIFY_TIMEOUT_MS = 650L
+        private const val MAX_ACTION_ATTEMPTS = 2
     }
 
     private var config = BotConfig.getDefaults()
@@ -42,8 +43,38 @@ class GameAccessibilityService : AccessibilityService() {
     private val isBotRunning = AtomicBoolean(false)
     private val isProcessing = AtomicBoolean(false)
     private val lastProcessTime = AtomicLong(0)
-    private val eventQueue = mutableListOf<AccessibilityEvent>()
     private val stats = BotStats()
+
+    private var pendingAction: PendingAction? = null
+
+    private data class PendingAction(
+        val decision: MoveDecision,
+        val beforeSignature: Int,
+        val dispatchedAt: Long,
+        val attempts: Int
+    )
+
+    private val tickRunnable = Runnable {
+        if (!isBotRunning.get()) return@Runnable
+        if (!isProcessing.compareAndSet(false, true)) {
+            scheduleNextTick()
+            return@Runnable
+        }
+
+        try {
+            lastProcessTime.set(System.currentTimeMillis())
+            val rootNode = rootInActiveWindow
+            if (rootNode != null && rootNode.packageName?.toString() == config.targetPackage) {
+                processGameEvent(rootNode)
+            }
+        } catch (t: Throwable) {
+            DebugLogger.e("Bot tick failed", t)
+            Log.e(TAG, "Bot tick failed", t)
+        } finally {
+            isProcessing.set(false)
+            if (isBotRunning.get()) scheduleNextTick()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -54,113 +85,175 @@ class GameAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Service created for package: ${config.targetPackage}")
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                         AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
-                         AccessibilityEvent.TYPE_VIEW_CLICKED or
-                         AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
-                         AccessibilityEvent.TYPE_VIEW_SCROLLED
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_CLICKED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_SCROLLED
             packageNames = arrayOf(config.targetPackage)
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             notificationTimeout = 100
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
-                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                    AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE or
-                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE or
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
         setServiceInfo(info)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val timer = performanceMonitor.startTimer("onAccessibilityEvent")
-        event?.let {
-            if (!isBotRunning.get()) { timer.stop(); return }
-            if (it.packageName?.toString() != config.targetPackage) { timer.stop(); return }
-
-            if (eventQueue.size >= MAX_EVENT_QUEUE_SIZE) {
-                eventQueue.removeAt(0)
-            }
-            eventQueue.add(it)
+        try {
+            val currentEvent = event ?: return
+            if (!isBotRunning.get()) return
+            if (currentEvent.packageName?.toString() != config.targetPackage) return
 
             val now = System.currentTimeMillis()
-            val interval = config.processIntervalMs
-            if (now - lastProcessTime.get() >= interval && isProcessing.compareAndSet(false, true)) {
-                lastProcessTime.set(now)
-                handler.post { processEventQueue() }
+            if (now - lastProcessTime.get() >= config.processIntervalMs) {
+                requestTick(0L)
             }
+        } finally {
+            timer.stop()
         }
-        timer.stop()
     }
 
-    private fun processEventQueue() {
-        val timer = performanceMonitor.startTimer("processEventQueue")
-        if (!isBotRunning.get()) {
-            isProcessing.set(false)
-            timer.stop()
-            return
-        }
-
-        val latestEvent = eventQueue.lastOrNull()
-        eventQueue.clear()
-
-        latestEvent?.let { event ->
-            val rootNode = rootInActiveWindow
-            rootNode?.let { processGameEvent(it) }
-        }
-
-        isProcessing.set(false)
-
-        if (isBotRunning.get()) {
-            scheduleNextTick()
-        }
-        timer.stop()
+    private fun requestTick(delayMs: Long) {
+        handler.removeCallbacks(tickRunnable)
+        handler.postDelayed(tickRunnable, delayMs.coerceAtLeast(0L))
     }
 
     private fun scheduleNextTick() {
-        handler.postDelayed({ processEventQueue() }, config.processIntervalMs)
+        requestTick(config.processIntervalMs.coerceAtLeast(25L))
     }
 
     private fun processGameEvent(rootNode: AccessibilityNodeInfo) {
         val timer = performanceMonitor.startTimer("processGameEvent")
+        try {
+            val parseTimer = performanceMonitor.startTimer("parseBoard")
+            val boardState = try {
+                boardParser.parseBoard(rootNode)
+            } finally {
+                parseTimer.stop()
+            } ?: return
 
-        val parseTimer = performanceMonitor.startTimer("parseBoard")
-        val boardState = boardParser.parseBoard(rootNode)
-        parseTimer.stop()
+            stats.updateBoard(boardState)
 
-        if (boardState == null) {
+            if (handlePendingAction(boardState)) return
+
+            if (!boardState.isStable()) {
+                val waiting = MoveDecision.wait("Waiting for board animation to settle")
+                broadcastState(boardState, waiting)
+                return
+            }
+
+            val decideTimer = performanceMonitor.startTimer("decideMove")
+            val decision = try {
+                decisionEngine.decideMove(boardState)
+            } finally {
+                decideTimer.stop()
+            }
+
+            stats.recordDecision(decision)
+            broadcastState(boardState, decision)
+
+            if (decision.action != MoveDecision.Action.WAIT && decision.action != MoveDecision.Action.NONE) {
+                dispatchAndTrack(decision, boardState)
+            }
+
+            if (stats.shouldLogPeriodic()) {
+                DebugLogger.i("Stats: ${stats.summary()}")
+                logPerformanceStats()
+            }
+        } finally {
             timer.stop()
-            return
+        }
+    }
+
+    /**
+     * Returns true when the current tick should stop because a previous action is still being
+     * verified, has just been verified, or was retried/failed.
+     */
+    private fun handlePendingAction(board: BoardState): Boolean {
+        val pending = pendingAction ?: return false
+        val currentSignature = board.signature()
+
+        if (currentSignature != pending.beforeSignature) {
+            pendingAction = null
+            stats.recordAction(true)
+            DebugLogger.i(
+                "Action verified after ${System.currentTimeMillis() - pending.dispatchedAt}ms: " +
+                    "${pending.decision.action} - ${pending.decision.reasoning}"
+            )
+            broadcastState(board, MoveDecision.wait("Previous action verified; synchronizing board"))
+            return true
         }
 
-        stats.updateBoard(boardState)
+        if (!board.isStable()) {
+            broadcastState(board, MoveDecision.wait("Action dispatched; board still animating"))
+            return true
+        }
 
-        val decideTimer = performanceMonitor.startTimer("decideMove")
-        val decision = decisionEngine.decideMove(boardState)
-        decideTimer.stop()
+        val elapsed = System.currentTimeMillis() - pending.dispatchedAt
+        val verifyTimeout = maxOf(MIN_VERIFY_TIMEOUT_MS, config.processIntervalMs * 4)
+        if (elapsed < verifyTimeout) {
+            broadcastState(board, MoveDecision.wait("Verifying previous action (${elapsed}ms)"))
+            return true
+        }
 
-        stats.recordDecision(decision)
+        if (pending.attempts < MAX_ACTION_ATTEMPTS) {
+            val actionTimer = performanceMonitor.startTimer("retryAction")
+            val accepted = try {
+                inputInjector.performAction(pending.decision, board)
+            } finally {
+                actionTimer.stop()
+            }
 
-        broadcastState(boardState, decision)
+            if (accepted) {
+                pendingAction = pending.copy(
+                    dispatchedAt = System.currentTimeMillis(),
+                    attempts = pending.attempts + 1
+                )
+                DebugLogger.w(
+                    "Action produced no board change; retry ${pending.attempts + 1}/$MAX_ACTION_ATTEMPTS"
+                )
+                broadcastState(board, MoveDecision.wait("Retrying unverified action"))
+                return true
+            }
+        }
 
-        if (decision.action != MoveDecision.Action.WAIT && decision.action != MoveDecision.Action.NONE) {
-            val actionTimer = performanceMonitor.startTimer("performAction")
-            val success = inputInjector.performAction(decision)
+        pendingAction = null
+        stats.recordAction(false)
+        DebugLogger.w("Action failed verification: ${pending.decision.action} - ${pending.decision.reasoning}")
+        broadcastState(board, MoveDecision.wait("Action failed verification; replanning"))
+        return true
+    }
+
+    private fun dispatchAndTrack(decision: MoveDecision, board: BoardState) {
+        val actionTimer = performanceMonitor.startTimer("performAction")
+        val accepted = try {
+            inputInjector.performAction(decision, board)
+        } finally {
             actionTimer.stop()
-            stats.recordAction(success)
-            DebugLogger.d("Action executed: $success - ${decision.reasoning}")
         }
 
-        if (stats.shouldLogPeriodic()) {
-            DebugLogger.i("Stats: ${stats.summary()}")
-            logPerformanceStats()
+        if (accepted) {
+            pendingAction = PendingAction(
+                decision = decision,
+                beforeSignature = board.signature(),
+                dispatchedAt = System.currentTimeMillis(),
+                attempts = 1
+            )
+            DebugLogger.d("Action dispatched; awaiting verification - ${decision.reasoning}")
+        } else {
+            stats.recordAction(false)
+            DebugLogger.w("Action dispatch rejected - ${decision.reasoning}")
         }
-
-        timer.stop()
     }
 
     private fun logPerformanceStats() {
-        val stats = performanceMonitor.getAllStats()
-        if (stats.isNotEmpty()) {
+        val performanceStats = performanceMonitor.getAllStats()
+        if (performanceStats.isNotEmpty()) {
             val sb = StringBuilder("Performance: ")
-            stats.forEach { sb.append("${it.key}=${it.avg}ms avg, ") }
+            performanceStats.forEach { sb.append("${it.key}=${it.avg}ms avg, ") }
             DebugLogger.d(sb.toString())
         }
     }
@@ -181,16 +274,19 @@ class GameAccessibilityService : AccessibilityService() {
     fun startBot() {
         if (isBotRunning.getAndSet(true)) return
         decisionEngine.reset()
+        pendingAction = null
         stats.reset()
         performanceMonitor.reset()
         DebugLogger.i("Bot started")
         broadcastBotState(true)
-        scheduleNextTick()
+        requestTick(0L)
     }
 
     fun stopBot() {
         if (!isBotRunning.getAndSet(false)) return
+        pendingAction = null
         handler.removeCallbacksAndMessages(null)
+        isProcessing.set(false)
         DebugLogger.i("Bot stopped")
         broadcastBotState(false)
     }
@@ -222,7 +318,10 @@ class GameAccessibilityService : AccessibilityService() {
             putExtra(EXTRA_BOARD_STATE, board.toString())
             putExtra(EXTRA_DECISION, "${decision.action} - ${decision.reasoning}")
             putExtra(EXTRA_STATS, stats.toBundle())
-            putExtra(EXTRA_PERFORMANCE, performanceMonitor.getAllStats().joinToString("; ") { it.toString() })
+            putExtra(
+                EXTRA_PERFORMANCE,
+                performanceMonitor.getAllStats().joinToString("; ") { it.toString() }
+            )
         }
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
@@ -252,6 +351,7 @@ class GameAccessibilityService : AccessibilityService() {
             }
         }
 
+        /** Records the verified result, not merely whether dispatchGesture accepted the request. */
         fun recordAction(success: Boolean) {
             actionsExecuted++
             if (success) successfulActions++
@@ -259,7 +359,7 @@ class GameAccessibilityService : AccessibilityService() {
 
         fun shouldLogPeriodic(): Boolean {
             val now = System.currentTimeMillis()
-            if (now - lastLogTime > 30000) {
+            if (now - lastLogTime > 30_000) {
                 lastLogTime = now
                 return true
             }
@@ -268,8 +368,9 @@ class GameAccessibilityService : AccessibilityService() {
 
         fun summary(): String {
             val runtime = (System.currentTimeMillis() - startTime) / 1000
-            val successRate = if (actionsExecuted > 0) (successfulActions * 100 / actionsExecuted) else 0
-            return "Runtime: ${runtime}s, Boards: $boardsProcessed, Actions: $actionsExecuted, Success: $successRate%, Merges: $mergesPerformed"
+            val successRate = if (actionsExecuted > 0) successfulActions * 100 / actionsExecuted else 0
+            return "Runtime: ${runtime}s, Boards: $boardsProcessed, Actions: $actionsExecuted, " +
+                "Verified success: $successRate%, Merge decisions: $mergesPerformed"
         }
 
         fun reset() {
@@ -281,14 +382,12 @@ class GameAccessibilityService : AccessibilityService() {
             lastLogTime = 0
         }
 
-        fun toBundle(): android.os.Bundle {
-            return android.os.Bundle().apply {
-                putLong("boardsProcessed", boardsProcessed)
-                putLong("actionsExecuted", actionsExecuted)
-                putLong("successfulActions", successfulActions)
-                putLong("mergesPerformed", mergesPerformed)
-                putLong("runtimeMs", System.currentTimeMillis() - startTime)
-            }
+        fun toBundle(): android.os.Bundle = android.os.Bundle().apply {
+            putLong("boardsProcessed", boardsProcessed)
+            putLong("actionsExecuted", actionsExecuted)
+            putLong("successfulActions", successfulActions)
+            putLong("mergesPerformed", mergesPerformed)
+            putLong("runtimeMs", System.currentTimeMillis() - startTime)
         }
     }
 }

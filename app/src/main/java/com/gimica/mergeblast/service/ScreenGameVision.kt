@@ -9,11 +9,8 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
 /**
- * Visual parser for the real Merge Blast board.
- *
- * Merge Blast renders its gameplay as graphics and may expose no useful tile nodes through the
- * accessibility hierarchy. This parser reads the visible powers-of-two with ML Kit OCR and maps
- * them to the game's five shooting columns.
+ * Visual parser for Merge Blast's five-column shooter board.
+ * OCR is deliberately restricted to the actual game area for minimum latency.
  */
 class ScreenBoardParser {
     companion object {
@@ -24,8 +21,12 @@ class ScreenBoardParser {
         private const val LAUNCHER_BOTTOM_FRACTION = 0.86f
         private const val LAUNCHER_CENTER_TOLERANCE = 0.20f
         private const val BOARD_LAUNCHER_GAP_FRACTION = 0.07f
-        private const val OCR_TOP_FRACTION = 0.18f
-        private const val OCR_BOTTOM_FRACTION = 0.88f
+
+        // Exclude edge widgets, header and bottom ad area from the hot gameplay OCR pass.
+        private const val OCR_LEFT_FRACTION = 0.07f
+        private const val OCR_RIGHT_FRACTION = 0.93f
+        private const val OCR_TOP_FRACTION = 0.19f
+        private const val OCR_BOTTOM_FRACTION = 0.84f
         private const val MAX_TILE_VALUE = 1 shl 20
     }
 
@@ -42,50 +43,69 @@ class ScreenBoardParser {
             return
         }
 
-        // OCR only the gameplay band. The score header and bottom advertisement contain lots of
-        // unrelated text and make full-screen recognition substantially slower.
+        val cropLeft = (bitmap.width * OCR_LEFT_FRACTION).toInt().coerceIn(0, bitmap.width - 1)
+        val cropRight = (bitmap.width * OCR_RIGHT_FRACTION).toInt().coerceIn(cropLeft + 1, bitmap.width)
         val cropTop = (bitmap.height * OCR_TOP_FRACTION).toInt().coerceIn(0, bitmap.height - 1)
         val cropBottom = (bitmap.height * OCR_BOTTOM_FRACTION).toInt().coerceIn(cropTop + 1, bitmap.height)
+
         val cropped = try {
-            Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, cropBottom - cropTop)
+            Bitmap.createBitmap(
+                bitmap,
+                cropLeft,
+                cropTop,
+                cropRight - cropLeft,
+                cropBottom - cropTop
+            )
         } catch (error: Exception) {
             onFailure(error)
             return
         }
 
-        val input = InputImage.fromBitmap(cropped, 0)
-        recognizer.process(input)
+        recognizer.process(InputImage.fromBitmap(cropped, 0))
             .addOnSuccessListener { result ->
-                val state = parseResult(result, bitmap.width, bitmap.height, cropTop)
+                val state = parseResult(
+                    result = result,
+                    width = bitmap.width,
+                    height = bitmap.height,
+                    xOffset = cropLeft,
+                    yOffset = cropTop
+                )
+
                 if (state != null) {
                     AdAutoCloser.onGameVisible()
                     onSuccess(state)
-                } else {
-                    // Normal game parsing deliberately ignores the ad/CTA areas for speed. Only
-                    // when no playable board is found do a second full-screen OCR pass to determine
-                    // whether an interstitial is blocking the game and close it automatically.
-                    val service = GameAccessibilityService.getInstance()
-                    if (service == null) {
-                        onSuccess(null)
-                    } else {
-                        adScreenDetector.inspect(
-                            bitmap,
-                            onSuccess = { adResult ->
-                                AdAutoCloser.handle(adResult, service)
-                                onSuccess(null)
-                            },
-                            onFailure = {
-                                // Ad detection is best-effort. A failed secondary OCR must never
-                                // break the main gameplay loop.
-                                onSuccess(null)
-                            }
-                        )
-                    }
+                    return@addOnSuccessListener
                 }
+
+                val service = GameAccessibilityService.getInstance()
+                if (service == null) {
+                    onSuccess(null)
+                    return@addOnSuccessListener
+                }
+
+                // First try the Accessibility tree: this is much cheaper than a second OCR pass and
+                // many ad SDKs expose Install/Close/Skip nodes even when the game itself exposes no
+                // useful board nodes.
+                if (AdAutoCloser.tryFastAccessibility(service) != null) {
+                    onSuccess(null)
+                    return@addOnSuccessListener
+                }
+
+                // Only if the cheap path has no evidence, OCR the top+bottom ad control strips.
+                adScreenDetector.inspect(
+                    bitmap,
+                    onSuccess = { adResult ->
+                        AdAutoCloser.handle(adResult, service)
+                        onSuccess(null)
+                    },
+                    onFailure = {
+                        onSuccess(null)
+                    }
+                )
             }
-            .addOnFailureListener { error -> onFailure(error) }
+            .addOnFailureListener(onFailure)
             .addOnCompleteListener {
-                if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                if (!cropped.isRecycled) cropped.recycle()
             }
     }
 
@@ -94,19 +114,28 @@ class ScreenBoardParser {
         adScreenDetector.close()
     }
 
-    private fun parseResult(result: Text, width: Int, height: Int, yOffset: Int): ScreenGameState? {
+    private fun parseResult(
+        result: Text,
+        width: Int,
+        height: Int,
+        xOffset: Int,
+        yOffset: Int
+    ): ScreenGameState? {
         if (width <= 0 || height <= 0 || width >= height) return null
 
         val numbers = result.textBlocks
-            .flatMap { it.lines }
-            .flatMap { it.elements }
-            .mapNotNull { parseNumericElement(it, yOffset) }
+            .asSequence()
+            .flatMap { it.lines.asSequence() }
+            .flatMap { it.elements.asSequence() }
+            .mapNotNull { parseNumericElement(it, xOffset, yOffset) }
             .filter { isTileValue(it.value) }
+            .toList()
 
         if (numbers.isEmpty()) return null
 
         val centerX = width / 2f
         val launcher = numbers
+            .asSequence()
             .filter { number ->
                 val cy = number.bounds.centerY().toFloat() / height
                 val cxDistance = abs(number.bounds.centerX() - centerX) / width
@@ -118,24 +147,31 @@ class ScreenBoardParser {
 
         val boardBottom = launcher.bounds.centerY() - (height * BOARD_LAUNCHER_GAP_FRACTION).toInt()
         val boardTop = (height * BOARD_TOP_FRACTION).toInt()
+        val mutableColumns = Array(COLUMN_COUNT) { ArrayList<ScreenTile>(5) }
+        var boardTileCount = 0
 
-        val boardTiles = numbers
-            .asSequence()
-            .filter { it !== launcher }
-            .filter { it.bounds.centerY() in boardTop until boardBottom }
-            .map { number ->
-                val column = nearestColumn(number.bounds.centerX(), width)
+        for (number in numbers) {
+            if (number === launcher) continue
+            val centerY = number.bounds.centerY()
+            if (centerY !in boardTop until boardBottom) continue
+            val column = nearestColumn(number.bounds.centerX(), width)
+            mutableColumns[column].add(
                 ScreenTile(
                     value = number.value,
                     column = column,
                     centerX = number.bounds.centerX(),
-                    centerY = number.bounds.centerY()
+                    centerY = centerY
                 )
-            }
-            .toList()
+            )
+            boardTileCount++
+        }
+
+        // A lone power-of-two subtitle/price in an ad must never be accepted as a game launcher.
+        if (boardTileCount == 0) return null
 
         val columns = List(COLUMN_COUNT) { column ->
-            boardTiles.filter { it.column == column }.sortedBy { it.centerY }
+            mutableColumns[column].sortBy { it.centerY }
+            mutableColumns[column].toList()
         }
 
         return ScreenGameState(
@@ -147,9 +183,9 @@ class ScreenBoardParser {
         )
     }
 
-    private fun parseNumericElement(element: Text.Element, yOffset: Int): NumericElement? {
+    private fun parseNumericElement(element: Text.Element, xOffset: Int, yOffset: Int): NumericElement? {
         val sourceBounds = element.boundingBox ?: return null
-        val bounds = Rect(sourceBounds).apply { offset(0, yOffset) }
+        val bounds = Rect(sourceBounds).apply { offset(xOffset, yOffset) }
         val cleaned = element.text
             .trim()
             .replace(" ", "")
@@ -164,10 +200,18 @@ class ScreenBoardParser {
     private fun isTileValue(value: Int): Boolean =
         value >= 2 && value <= MAX_TILE_VALUE && value and (value - 1) == 0
 
-    private fun nearestColumn(x: Int, width: Int): Int =
-        COLUMN_CENTER_FRACTIONS.indices.minByOrNull { column ->
-            abs(x - width * COLUMN_CENTER_FRACTIONS[column])
-        } ?: 2
+    private fun nearestColumn(x: Int, width: Int): Int {
+        var bestColumn = 2
+        var bestDistance = Float.MAX_VALUE
+        for (column in 0 until COLUMN_COUNT) {
+            val distance = abs(x - width * COLUMN_CENTER_FRACTIONS[column])
+            if (distance < bestDistance) {
+                bestDistance = distance
+                bestColumn = column
+            }
+        }
+        return bestColumn
+    }
 
     fun columnCenterX(column: Int, width: Int): Int {
         val safeColumn = column.coerceIn(0, COLUMN_COUNT - 1)
@@ -221,36 +265,61 @@ data class ScreenMove(
     val reasoning: String
 )
 
-/** Greedy shooter tailored to Merge Blast's five-column launch mechanic. */
+/** Allocation-light O(5) decision path for the five shooting columns. */
 class ScreenDecisionEngine(private val parser: ScreenBoardParser) {
     fun decide(state: ScreenGameState): ScreenMove {
         val launcher = state.launcherValue
 
-        val mergeCandidates = state.columns.indices.mapNotNull { column ->
+        var bestMergeColumn = -1
+        var bestMergeDepth = -1
+        var bestMergeHeight = Int.MAX_VALUE
+
+        for (column in 0 until ScreenBoardParser.COLUMN_COUNT) {
             val stack = state.columns[column]
-            val incomingSide = stack.lastOrNull() ?: return@mapNotNull null
-            if (incomingSide.value != launcher) return@mapNotNull null
-            column to chainDepth(stack, launcher)
+            val incoming = stack.lastOrNull() ?: continue
+            if (incoming.value != launcher) continue
+
+            val depth = chainDepth(stack, launcher)
+            if (depth > bestMergeDepth ||
+                (depth == bestMergeDepth && stack.size < bestMergeHeight)
+            ) {
+                bestMergeColumn = column
+                bestMergeDepth = depth
+                bestMergeHeight = stack.size
+            }
         }
 
         val chosenColumn: Int
         val confidence: Float
         val reason: String
 
-        if (mergeCandidates.isNotEmpty()) {
-            val best = mergeCandidates.maxWithOrNull(
-                compareBy<Pair<Int, Int>> { it.second }
-                    .thenBy { -state.columns[it.first].size }
-            )!!
-            chosenColumn = best.first
-            confidence = if (best.second >= 2) 0.98f else 0.94f
-            reason = "Shoot $launcher into column ${chosenColumn + 1}; merge chain depth ${best.second}"
+        if (bestMergeColumn >= 0) {
+            chosenColumn = bestMergeColumn
+            confidence = if (bestMergeDepth >= 2) 0.98f else 0.94f
+            reason = "Shoot $launcher into column ${chosenColumn + 1}; merge chain depth $bestMergeDepth"
         } else {
-            chosenColumn = state.columns.indices.minWithOrNull(
-                compareBy<Int> { state.columns[it].size }
-                    .thenBy { columnRisk(state.columns[it], launcher) }
-                    .thenBy { abs(it - 2) }
-            ) ?: 2
+            var bestColumn = 2
+            var bestHeight = Int.MAX_VALUE
+            var bestRisk = Int.MAX_VALUE
+            var bestCenterDistance = Int.MAX_VALUE
+
+            for (column in 0 until ScreenBoardParser.COLUMN_COUNT) {
+                val stack = state.columns[column]
+                val height = stack.size
+                val risk = columnRisk(stack, launcher)
+                val centerDistance = abs(column - 2)
+                if (height < bestHeight ||
+                    (height == bestHeight && risk < bestRisk) ||
+                    (height == bestHeight && risk == bestRisk && centerDistance < bestCenterDistance)
+                ) {
+                    bestColumn = column
+                    bestHeight = height
+                    bestRisk = risk
+                    bestCenterDistance = centerDistance
+                }
+            }
+
+            chosenColumn = bestColumn
             confidence = 0.70f
             reason = "Shoot $launcher into safest column ${chosenColumn + 1} (no immediate merge)"
         }
@@ -261,12 +330,12 @@ class ScreenDecisionEngine(private val parser: ScreenBoardParser) {
     }
 
     private fun chainDepth(stack: List<ScreenTile>, launcherValue: Int): Int {
-        if (stack.isEmpty()) return 0
         var value = launcherValue
         var depth = 0
         for (index in stack.lastIndex downTo 0) {
             if (stack[index].value != value) break
             depth++
+            if (value > Int.MAX_VALUE / 2) break
             value *= 2
         }
         return depth

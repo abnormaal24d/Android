@@ -32,12 +32,16 @@ class GameAccessibilityService : AccessibilityService() {
         private const val DEFAULT_TARGET_PACKAGE = "com.gimica.mergeblast"
         private const val MIN_VERIFY_TIMEOUT_MS = 650L
 
-        // Android's AccessibilityService screenshot API has a platform rate limit of 333ms.
-        // Stay just above it so Samsung/Android 16 does not reject captures as too frequent.
-        private const val VISION_CAPTURE_INTERVAL_MS = 350L
-        private const val VISION_TICK_INTERVAL_MS = 80L
-        private const val VISION_VERIFY_TIMEOUT_MS = 900L
-        private const val VISION_STABLE_OBSERVATIONS = 2
+        // Android rate-limits AccessibilityService.takeScreenshot() to roughly 333ms.
+        // 340ms is deliberately only a few milliseconds above that floor.
+        private const val VISION_CAPTURE_INTERVAL_MS = 340L
+        private const val VISION_OCR_POLL_MS = 60L
+        private const val VISION_VERIFY_TIMEOUT_MS = 760L
+
+        // Turbo mode: the parser already requires a valid power-of-two launcher in the expected
+        // region, so one valid visual state is sufficient. Pending-action verification prevents
+        // duplicate shots while the previous move is still being processed.
+        private const val VISION_STABLE_OBSERVATIONS = 1
 
         @Volatile
         private var activeInstance: GameAccessibilityService? = null
@@ -80,7 +84,6 @@ class GameAccessibilityService : AccessibilityService() {
     private data class PendingVisionAction(
         val move: ScreenMove,
         val beforeSignature: Int,
-        val beforeLauncherValue: Int,
         val dispatchedAt: Long
     )
 
@@ -160,9 +163,13 @@ class GameAccessibilityService : AccessibilityService() {
             if (!isBotRunning.get()) return
             if (packageName != config.targetPackage) return
 
+            // Once visual mode is active, the exact screenshot deadline drives the loop. Event-
+            // triggered immediate ticks would only create extra wakeups before Android permits the
+            // next screenshot.
+            if (useVisionMode) return
+
             val now = System.currentTimeMillis()
-            val eventInterval = if (useVisionMode) VISION_TICK_INTERVAL_MS else config.processIntervalMs
-            if (now - lastProcessTime.get() >= eventInterval) {
+            if (now - lastProcessTime.get() >= config.processIntervalMs) {
                 requestTick(0L)
             }
         } finally {
@@ -177,9 +184,21 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     private fun scheduleNextTick() {
-        val normalDelay = config.processIntervalMs.coerceAtLeast(25L)
-        val delay = if (useVisionMode) minOf(normalDelay, VISION_TICK_INTERVAL_MS) else normalDelay
-        requestTick(delay)
+        if (!useVisionMode) {
+            requestTick(config.processIntervalMs.coerceAtLeast(25L))
+            return
+        }
+
+        // Schedule against the screenshot deadline rather than polling every N milliseconds.
+        // This avoids quantization (e.g. 350ms becoming 400ms with an 80ms poll interval).
+        if (visionInFlight.get()) {
+            requestTick(VISION_OCR_POLL_MS)
+            return
+        }
+
+        val elapsed = System.currentTimeMillis() - lastVisionCaptureAt
+        val remaining = (VISION_CAPTURE_INTERVAL_MS - elapsed).coerceAtLeast(0L)
+        requestTick(remaining)
     }
 
     private fun processGameEvent(rootNode: AccessibilityNodeInfo) {
@@ -193,14 +212,12 @@ class GameAccessibilityService : AccessibilityService() {
             }
 
             if (boardState == null) {
-                // Merge Blast renders the live board graphically on current versions. Once the
-                // hierarchy proves unusable, stay in visual mode for this bot session.
                 useVisionMode = true
                 pendingAction = null
                 decisionEngine.reset()
                 broadcastSimpleStatus(
                     "Accessibility tiles unavailable; switching to screenshot OCR",
-                    "Vision mode starting"
+                    "Turbo vision mode starting"
                 )
                 requestVisionCapture()
                 return
@@ -303,9 +320,7 @@ class GameAccessibilityService : AccessibilityService() {
                 override fun onFailure(errorCode: Int) {
                     visionInFlight.set(false)
                     if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
-                        // Normal back-pressure from Android's 333ms screenshot limit. Do not mark
-                        // vision as broken; simply wait for the next scheduled tick.
-                        DebugLogger.d("Screenshot rate-limited by Android; retrying on next tick")
+                        DebugLogger.d("Screenshot rate-limited by Android; retrying at deadline")
                         return
                     }
                     DebugLogger.w("Screenshot failed with code $errorCode")
@@ -316,8 +331,6 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     private fun handleVisionState(state: ScreenGameState) {
-        // Graphical games can temporarily expose no root node. We already track the last package
-        // from accessibility events, so do not discard a valid OCR result just because root is null.
         if (lastForegroundPackage != config.targetPackage) return
 
         stats.recordVisionBoard()
@@ -335,12 +348,12 @@ class GameAccessibilityService : AccessibilityService() {
                 pendingVisionAction = null
                 stats.recordVisionAction(true)
 
-                // If the launcher changed too, the game has already loaded the next playable
-                // block. Reuse this OCR frame immediately instead of paying for another capture.
-                val nextLauncherReady = state.launcherValue != pending.beforeLauncherValue
-                visionStableObservations = if (nextLauncherReady) VISION_STABLE_OBSERVATIONS else 1
+                // parse() only returns a state when a valid launcher is visible. Therefore a
+                // changed board is enough proof that the next playable state is available, even if
+                // the random next launcher happens to have the same numeric value as the old one.
+                visionStableObservations = VISION_STABLE_OBSERVATIONS
                 broadcastVisionState(state, "Verified: ${pending.move.reasoning}")
-                if (!nextLauncherReady) return
+                // Deliberately continue below and make the next decision from this same OCR frame.
             } else {
                 val elapsed = System.currentTimeMillis() - pending.dispatchedAt
                 if (elapsed < VISION_VERIFY_TIMEOUT_MS) {
@@ -348,7 +361,6 @@ class GameAccessibilityService : AccessibilityService() {
                     return
                 }
 
-                // Do not blindly repeat a vision tap. Re-observe and make a fresh decision.
                 pendingVisionAction = null
                 visionStableObservations = 0
                 stats.recordVisionAction(false)
@@ -364,15 +376,14 @@ class GameAccessibilityService : AccessibilityService() {
 
         val move = screenDecisionEngine.decide(state)
         stats.recordVisionDecision()
-        val accepted = inputInjector.performTap(move.tapX, move.tapY)
+        val accepted = inputInjector.performFastTap(move.tapX, move.tapY)
         if (accepted) {
             pendingVisionAction = PendingVisionAction(
                 move = move,
                 beforeSignature = signature,
-                beforeLauncherValue = state.launcherValue,
                 dispatchedAt = System.currentTimeMillis()
             )
-            broadcastVisionState(state, "SHOT column ${move.column + 1}: ${move.reasoning}")
+            broadcastVisionState(state, "TURBO SHOT column ${move.column + 1}: ${move.reasoning}")
         } else {
             stats.recordVisionAction(false)
             broadcastVisionState(state, "Shot dispatch rejected; ${move.reasoning}")

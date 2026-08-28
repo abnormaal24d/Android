@@ -70,8 +70,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Android 16 / targetSdk 36 enforces edge-to-edge. Keep it explicit and consume safe
-        // drawing insets in Compose so controls never end up behind status/navigation bars.
         enableEdgeToEdge()
         refreshServiceState()
 
@@ -119,7 +117,37 @@ class MainActivity : ComponentActivity() {
             )
             return
         }
+
+        val wasRunning = service.isRunning()
         service.toggleBot()
+
+        if (!wasRunning && service.isRunning()) {
+            val targetPackage = service.getConfig().targetPackage
+            val launchIntent = packageManager.getLaunchIntentForPackage(targetPackage)
+            if (launchIntent == null) {
+                service.stopBot()
+                botState = botState.copy(
+                    isRunning = false,
+                    lastBoard = "Merge Blast niet gevonden",
+                    lastDecision = "Kan $targetPackage niet starten; controleer of het spel geïnstalleerd is"
+                )
+                return
+            }
+
+            // Do not leave the user staring at the controller while direct vision waits for the
+            // target package. Starting the bot now immediately foregrounds Merge Blast, after which
+            // the AccessibilityService receives the target-package event and starts screenshot OCR.
+            botState = botState.copy(
+                isRunning = true,
+                lastBoard = "Direct vision mode",
+                lastDecision = "Merge Blast openen; wachten op eerste screenshot"
+            )
+            launchIntent.addFlags(
+                Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+            )
+            startActivity(launchIntent)
+        }
     }
 
     private fun refreshServiceState() {

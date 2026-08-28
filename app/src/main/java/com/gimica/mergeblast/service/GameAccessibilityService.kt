@@ -86,7 +86,6 @@ class GameAccessibilityService : AccessibilityService() {
         gameProfile = GameProfile.getOrDefault(config.targetPackage)
         DebugLogger.init(this, config.enableDebugLogging)
         applyRuntimeConfig()
-        configureAccessibilityService()
         Log.d(TAG, "Service created for package: ${config.targetPackage}")
     }
 
@@ -189,10 +188,6 @@ class GameAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Returns true when the current tick should stop because a previous action is still being
-     * verified, has just been verified, or was retried/failed.
-     */
     private fun handlePendingAction(board: BoardState): Boolean {
         val pending = pendingAction ?: return false
         val currentSignature = board.signature()
@@ -384,7 +379,6 @@ class GameAccessibilityService : AccessibilityService() {
             }
         }
 
-        /** Records the verified result, not merely whether dispatchGesture accepted the request. */
         fun recordAction(success: Boolean) {
             actionsExecuted++
             if (success) successfulActions++

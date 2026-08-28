@@ -1,9 +1,8 @@
 package com.gimica.mergeblast.service
 
 import android.graphics.Rect
-import android.view.accessibility.AccessibilityNodeInfo
-import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class Tile(
     val row: Int,
@@ -18,7 +17,8 @@ data class Tile(
     fun canMergeWith(other: Tile): Boolean =
         value == other.value && !isMoving && !other.isMoving
 
-    override fun toString(): String = "Tile($row,$col)=$value [${bounds.left},${bounds.top}-${bounds.right},${bounds.bottom}]"
+    override fun toString(): String =
+        "Tile($row,$col)=$value [${bounds.left},${bounds.top}-${bounds.right},${bounds.bottom}]"
 }
 
 data class BoardState(
@@ -45,32 +45,41 @@ data class BoardState(
 
     fun getHighestTile(): Tile? = tiles.maxByOrNull { it.value }
 
+    /**
+     * Stable signature of the logical board. Screen bounds and timestamps are deliberately ignored,
+     * so this can be used to verify whether an injected action actually changed the game state.
+     */
+    fun signature(): Int = tiles
+        .sortedWith(compareBy<Tile>({ it.row }, { it.col }, { it.value }))
+        .fold(17) { acc, tile ->
+            (((acc * 31 + tile.row) * 31 + tile.col) * 31 + tile.value)
+        }
+
+    fun isStable(): Boolean = tiles.none { it.isMoving }
+
     fun getMergeablePairs(): List<Pair<Tile, Tile>> {
         val pairs = mutableListOf<Pair<Tile, Tile>>()
-        val directions = listOf(
-            Pair(0, 1),  // right
-            Pair(1, 0),  // down
-            Pair(0, -1), // left
-            Pair(-1, 0)  // up
-        )
+        // Right/down only prevents returning both A->B and B->A for the same pair.
+        val directions = listOf(0 to 1, 1 to 0)
 
         tiles.forEach { tile ->
             directions.forEach { (dr, dc) ->
-                val nr = tile.row + dr
-                val nc = tile.col + dc
-                val neighbor = getTileAt(nr, nc)
+                val neighbor = getTileAt(tile.row + dr, tile.col + dc)
                 if (neighbor != null && tile.canMergeWith(neighbor)) {
                     pairs.add(tile to neighbor)
                 }
             }
         }
-        return pairs.distinctBy { (a, b) -> a.row * 100 + a.col to b.row * 100 + b.col }
+        return pairs
     }
 
     fun getEmptyNeighbors(tile: Tile): List<Pair<Int, Int>> {
         val neighbors = mutableListOf<Pair<Int, Int>>()
         val directions = listOf(
-            Pair(0, 1), Pair(1, 0), Pair(0, -1), Pair(-1, 0)
+            0 to 1,
+            1 to 0,
+            0 to -1,
+            -1 to 0
         )
         directions.forEach { (dr, dc) ->
             val nr = tile.row + dr
@@ -82,6 +91,52 @@ data class BoardState(
         return neighbors
     }
 
+    /**
+     * Resolve a logical grid cell to screen coordinates. Existing tile centers are preferred.
+     * Empty cells are estimated from the observed grid spacing, with tile-size fallback.
+     */
+    fun estimateCellCenter(row: Int, col: Int, anchor: Tile? = null): Pair<Int, Int>? {
+        if (row !in 0 until gridRows || col !in 0 until gridCols) return null
+
+        getTileAt(row, col)?.let { return it.centerX to it.centerY }
+
+        val reference = anchor ?: tiles.minByOrNull { abs(it.row - row) + abs(it.col - col) } ?: return null
+        val horizontalStep = estimateAxisStep(tiles.map { it.col to it.centerX })
+            ?: (reference.bounds.width().coerceAtLeast(1) * 1.12f)
+        val verticalStep = estimateAxisStep(tiles.map { it.row to it.centerY })
+            ?: (reference.bounds.height().coerceAtLeast(1) * 1.12f)
+
+        val knownX = averageCenterForIndex(tiles.map { it.col to it.centerX }, col)
+        val knownY = averageCenterForIndex(tiles.map { it.row to it.centerY }, row)
+
+        val targetX = knownX ?: (reference.centerX + (col - reference.col) * horizontalStep).roundToInt()
+        val targetY = knownY ?: (reference.centerY + (row - reference.row) * verticalStep).roundToInt()
+        return targetX to targetY
+    }
+
+    private fun averageCenterForIndex(samples: List<Pair<Int, Int>>, index: Int): Int? {
+        val values = samples.filter { it.first == index }.map { it.second }
+        return if (values.isEmpty()) null else values.average().roundToInt()
+    }
+
+    private fun estimateAxisStep(samples: List<Pair<Int, Int>>): Float? {
+        val centersByIndex = samples
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, values) -> values.average().toFloat() }
+            .toSortedMap()
+
+        if (centersByIndex.size < 2) return null
+
+        val entries = centersByIndex.entries.toList()
+        val steps = entries.zipWithNext().mapNotNull { (a, b) ->
+            val indexDelta = b.key - a.key
+            if (indexDelta == 0) null else (b.value - a.value) / indexDelta
+        }.filter { abs(it) > 1f }
+
+        if (steps.isEmpty()) return null
+        return steps.sorted()[steps.size / 2]
+    }
+
     fun simulateMerge(tile1: Tile, tile2: Tile): BoardState {
         val newTiles = tiles.toMutableList()
         val mergedValue = tile1.value * 2
@@ -91,7 +146,18 @@ data class BoardState(
         newTiles.removeAll { it == tile1 || it == tile2 }
         newTiles.add(Tile(targetRow, targetCol, mergedValue, tile2.bounds))
 
-        return copy(tiles = newTiles)
+        val occupied = newTiles.map { it.row to it.col }.toSet()
+        val newEmptyCells = (0 until gridRows).flatMap { row ->
+            (0 until gridCols).mapNotNull { col ->
+                (row to col).takeUnless { it in occupied }
+            }
+        }
+
+        return copy(
+            tiles = newTiles,
+            emptyCells = newEmptyCells,
+            timestamp = System.currentTimeMillis()
+        )
     }
 
     override fun toString(): String =
@@ -116,23 +182,34 @@ data class MissionProgress(
 data class MoveDecision(
     val action: Action,
     val sourceTile: Tile? = null,
+    /** Logical destination row, not a screen Y coordinate. */
     val targetRow: Int = -1,
+    /** Logical destination column, not a screen X coordinate. */
     val targetCol: Int = -1,
     val confidence: Float = 0f,
     val reasoning: String = ""
 ) {
     enum class Action {
-        TAP,      // Tap on a tile to select/shoot
-        SWIPE,    // Swipe to move/aim
-        WAIT,     // Wait for board to stabilize
-        NONE      // No action needed
+        TAP,
+        SWIPE,
+        WAIT,
+        NONE
     }
 
     companion object {
         fun wait(reason: String) = MoveDecision(Action.WAIT, reasoning = reason)
         fun none(reason: String) = MoveDecision(Action.NONE, reasoning = reason)
-        fun tap(tile: Tile, reason: String) = MoveDecision(Action.TAP, sourceTile = tile, reasoning = reason, confidence = 0.8f)
-        fun swipe(fromX: Int, fromY: Int, toX: Int, toY: Int, reason: String) =
-            MoveDecision(Action.SWIPE, targetRow = toX, targetCol = toY, reasoning = reason, confidence = 0.7f)
+        fun tap(tile: Tile, reason: String) =
+            MoveDecision(Action.TAP, sourceTile = tile, reasoning = reason, confidence = 0.8f)
+
+        fun swipe(tile: Tile, targetRow: Int, targetCol: Int, reason: String) =
+            MoveDecision(
+                action = Action.SWIPE,
+                sourceTile = tile,
+                targetRow = targetRow,
+                targetCol = targetCol,
+                reasoning = reason,
+                confidence = 0.7f
+            )
     }
 }

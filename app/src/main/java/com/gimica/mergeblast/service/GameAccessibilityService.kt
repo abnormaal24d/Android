@@ -195,8 +195,8 @@ class GameAccessibilityService : AccessibilityService() {
         takeScreenshot(
             Display.DEFAULT_DISPLAY,
             mainExecutor,
-            object : TakeScreenshotCallback {
-                override fun onSuccess(screenshot: ScreenshotResult) {
+            object : AccessibilityService.TakeScreenshotCallback {
+                override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
                     val hardwareBuffer = screenshot.hardwareBuffer
                     val hardwareBitmap = try {
                         Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)

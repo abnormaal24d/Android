@@ -1,0 +1,13 @@
+# Android/Gradle machine-local state
+local.properties
+.gradle/
+/build/
+
+# IDE files
+.idea/
+*.iml
+
+# Native/generated build output
+.externalNativeBuild/
+.cxx/
+captures/

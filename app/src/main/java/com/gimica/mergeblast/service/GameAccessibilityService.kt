@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicLong
 class GameAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "GameAccessibilityService"
-        const val ACTION_BOT_STATE_CHANGED = "com.gimica.mergeblast.BOT_STATE_CHANGED"
+        const val ACTION_BOT_STATE_CHANGED = "com.gimica.mergeblast.autoplayer.BOT_STATE_CHANGED"
         const val EXTRA_BOT_RUNNING = "bot_running"
         const val EXTRA_BOARD_STATE = "board_state"
         const val EXTRA_DECISION = "decision"
@@ -28,7 +28,11 @@ class GameAccessibilityService : AccessibilityService() {
 
         private const val DEFAULT_TARGET_PACKAGE = "com.gimica.mergeblast"
         private const val MIN_VERIFY_TIMEOUT_MS = 650L
-        private const val MAX_ACTION_ATTEMPTS = 2
+
+        @Volatile
+        private var activeInstance: GameAccessibilityService? = null
+
+        fun getInstance(): GameAccessibilityService? = activeInstance
     }
 
     private var config = BotConfig.getDefaults()
@@ -81,8 +85,26 @@ class GameAccessibilityService : AccessibilityService() {
         config = BotConfig.load(this)
         gameProfile = GameProfile.getOrDefault(config.targetPackage)
         DebugLogger.init(this, config.enableDebugLogging)
-
+        applyRuntimeConfig()
+        configureAccessibilityService()
         Log.d(TAG, "Service created for package: ${config.targetPackage}")
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        activeInstance = this
+        applyRuntimeConfig()
+        configureAccessibilityService()
+        DebugLogger.i("Accessibility service connected")
+        broadcastBotState(isBotRunning.get())
+    }
+
+    private fun applyRuntimeConfig() {
+        decisionEngine.updateConfig(config)
+        inputInjector.updateConfig(config)
+    }
+
+    private fun configureAccessibilityService() {
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
@@ -94,7 +116,6 @@ class GameAccessibilityService : AccessibilityService() {
             notificationTimeout = 100
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
         setServiceInfo(info)
@@ -193,13 +214,18 @@ class GameAccessibilityService : AccessibilityService() {
         }
 
         val elapsed = System.currentTimeMillis() - pending.dispatchedAt
-        val verifyTimeout = maxOf(MIN_VERIFY_TIMEOUT_MS, config.processIntervalMs * 4)
+        val verifyTimeout = maxOf(
+            MIN_VERIFY_TIMEOUT_MS,
+            config.processIntervalMs.coerceAtLeast(25L) * 4,
+            config.retryDelayMs.coerceAtLeast(0L) * 2
+        )
         if (elapsed < verifyTimeout) {
             broadcastState(board, MoveDecision.wait("Verifying previous action (${elapsed}ms)"))
             return true
         }
 
-        if (pending.attempts < MAX_ACTION_ATTEMPTS) {
+        val maxAttempts = config.maxRetries.coerceIn(1, 5)
+        if (pending.attempts < maxAttempts) {
             val actionTimer = performanceMonitor.startTimer("retryAction")
             val accepted = try {
                 inputInjector.performAction(pending.decision, board)
@@ -208,12 +234,13 @@ class GameAccessibilityService : AccessibilityService() {
             }
 
             if (accepted) {
+                val nextAttempt = pending.attempts + 1
                 pendingAction = pending.copy(
                     dispatchedAt = System.currentTimeMillis(),
-                    attempts = pending.attempts + 1
+                    attempts = nextAttempt
                 )
                 DebugLogger.w(
-                    "Action produced no board change; retry ${pending.attempts + 1}/$MAX_ACTION_ATTEMPTS"
+                    "Action produced no board change; retry $nextAttempt/$maxAttempts"
                 )
                 broadcastState(board, MoveDecision.wait("Retrying unverified action"))
                 return true
@@ -267,6 +294,7 @@ class GameAccessibilityService : AccessibilityService() {
         DebugLogger.w("Service destroyed")
         stopBot()
         handler.removeCallbacksAndMessages(null)
+        if (activeInstance === this) activeInstance = null
         DebugLogger.shutdown()
         super.onDestroy()
     }
@@ -275,6 +303,7 @@ class GameAccessibilityService : AccessibilityService() {
         if (isBotRunning.getAndSet(true)) return
         decisionEngine.reset()
         pendingAction = null
+        lastProcessTime.set(0L)
         stats.reset()
         performanceMonitor.reset()
         DebugLogger.i("Bot started")
@@ -304,6 +333,8 @@ class GameAccessibilityService : AccessibilityService() {
     fun updateConfig(newConfig: BotConfig) {
         config = newConfig
         gameProfile = GameProfile.getOrDefault(config.targetPackage)
+        applyRuntimeConfig()
+        configureAccessibilityService()
         BotConfig.save(this, config)
         DebugLogger.i("Config updated: ${config.targetPackage}")
     }

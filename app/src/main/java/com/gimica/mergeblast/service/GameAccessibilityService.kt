@@ -286,8 +286,10 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        DebugLogger.w("Service interrupted")
-        stopBot()
+        DebugLogger.w("Accessibility service interrupted; keeping bot state")
+        if (isBotRunning.get()) {
+            requestTick(config.processIntervalMs.coerceAtLeast(25L))
+        }
     }
 
     override fun onDestroy() {

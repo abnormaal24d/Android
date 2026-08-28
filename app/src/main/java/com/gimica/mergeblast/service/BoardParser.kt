@@ -47,7 +47,8 @@ class BoardParser {
         }
 
         val tiles = sanitizeTiles(parsedTiles) ?: return null
-        val (gridRows, gridCols) = inferGridSize(tiles)
+        val gridSize = inferGridSize(tiles) ?: return null
+        val (gridRows, gridCols) = gridSize
         if (gridRows !in 1..MAX_REASONABLE_GRID_SIZE || gridCols !in 1..MAX_REASONABLE_GRID_SIZE) {
             Log.w(TAG, "Rejecting unreasonable grid ${gridRows}x$gridCols")
             return null
@@ -80,7 +81,7 @@ class BoardParser {
     /**
      * Duplicate logical positions mean the hierarchy-to-grid mapping is ambiguous. A few nested
      * duplicates can be collapsed safely; a mostly-collapsed board is rejected so the bot never
-     * acts on a fabricated 4x4 board full of false empty cells.
+     * acts on a fabricated board full of false empty cells.
      */
     private fun sanitizeTiles(parsedTiles: List<Tile>): List<Tile>? {
         val grouped = parsedTiles.groupBy { it.row to it.col }
@@ -104,15 +105,15 @@ class BoardParser {
     }
 
     /**
-     * Hash every property that can materially change the parsed game state. In particular,
-     * contentDescription must participate because some games expose tile values only there.
+     * Hash every property that can materially change the parsed game state. Accessibility getters
+     * are Java platform types and may return null, so every nullable property is hashed safely.
      */
     private fun computeTreeHash(node: AccessibilityNodeInfo): Int {
         var hash = 17
-        hash = hash * 31 + node.className.hashCode()
-        hash = hash * 31 + node.text.hashCode()
-        hash = hash * 31 + node.contentDescription.hashCode()
-        hash = hash * 31 + node.viewIdResourceName.hashCode()
+        hash = hash * 31 + (node.className?.hashCode() ?: 0)
+        hash = hash * 31 + (node.text?.hashCode() ?: 0)
+        hash = hash * 31 + (node.contentDescription?.hashCode() ?: 0)
+        hash = hash * 31 + (node.viewIdResourceName?.hashCode() ?: 0)
         hash = hash * 31 + node.childCount
         hash = hash * 31 + if (node.isSelected) 1 else 0
         hash = hash * 31 + if (node.isContentInvalid) 1 else 0
@@ -190,9 +191,15 @@ class BoardParser {
 
         if (value <= 0) return null
 
+        val position = estimateGridPosition(node)
+        if (position == null) {
+            Log.d(TAG, "Skipping tile value=$value: logical position could not be resolved safely")
+            return null
+        }
+
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
-        val (row, col) = estimateGridPosition(node)
+        val (row, col) = position
 
         return Tile(
             row = row,
@@ -214,8 +221,9 @@ class BoardParser {
     /**
      * Prefer hierarchy indices because they preserve empty cells. Flat Grid/Recycler containers
      * are translated from child index to row/column instead of treating every child as a new row.
+     * If both axes cannot be resolved, fail closed instead of fabricating (0,0).
      */
-    private fun estimateGridPosition(node: AccessibilityNodeInfo): Pair<Int, Int> {
+    private fun estimateGridPosition(node: AccessibilityNodeInfo): Pair<Int, Int>? {
         var currentNode: AccessibilityNodeInfo? = node
         var parent = currentNode?.parent
         var row: Int? = null
@@ -251,7 +259,7 @@ class BoardParser {
             depth++
         }
 
-        return (row ?: 0) to (col ?: 0)
+        return if (row != null && col != null) row to col else null
     }
 
     private fun inferColumnCount(parent: AccessibilityNodeInfo): Int {
@@ -283,14 +291,29 @@ class BoardParser {
         return -1
     }
 
-    private fun inferGridSize(tiles: List<Tile>): Pair<Int, Int> {
-        if (tiles.isEmpty()) return 4 to 4
+    private fun inferGridSize(tiles: List<Tile>): Pair<Int, Int>? {
+        if (tiles.isEmpty()) return null
 
         val rows = tiles.map { it.row }.distinct().sorted()
         val cols = tiles.map { it.col }.distinct().sorted()
-        val inferredRows = if (rows.size > 1) rows.last() + 1 else 4
-        val inferredCols = if (cols.size > 1) cols.last() + 1 else 4
+        if (rows.any { it < 0 } || cols.any { it < 0 }) return null
 
+        val rowSpan = (rows.lastOrNull() ?: 0) + 1
+        val colSpan = (cols.lastOrNull() ?: 0) + 1
+
+        // Logical child indices legitimately contain gaps when a complete row/column is empty.
+        // Preserve those gaps, but reject very sparse spans that are more likely a bad hierarchy map.
+        if (rowSpan > 4 && rows.size * 2 < rowSpan) {
+            Log.w(TAG, "Rejecting sparse row mapping: rows=$rows span=$rowSpan")
+            return null
+        }
+        if (colSpan > 4 && cols.size * 2 < colSpan) {
+            Log.w(TAG, "Rejecting sparse column mapping: cols=$cols span=$colSpan")
+            return null
+        }
+
+        val inferredRows = if (rows.size > 1) rowSpan else 4
+        val inferredCols = if (cols.size > 1) colSpan else 4
         return max(inferredRows, 4) to max(inferredCols, 4)
     }
 
@@ -313,19 +336,30 @@ class BoardParser {
             node.extras?.getBoolean("isMoving") == true
 
     private fun extractScore(root: AccessibilityNodeInfo): Int =
-        findStructuredNumbers(root, setOf("score", "points"), maxDepth = 2, minNumbers = 1)
-            ?.firstOrNull() ?: 0
+        findStructuredNumbers(
+            root,
+            setOf("score", "points"),
+            maxDepth = 2,
+            minNumbers = 1,
+            maxNumbers = 2
+        )?.firstOrNull() ?: 0
 
     private fun extractLevel(root: AccessibilityNodeInfo): Int =
-        findStructuredNumbers(root, setOf("level", "stage", "wave"), maxDepth = 2, minNumbers = 1)
-            ?.firstOrNull() ?: 1
+        findStructuredNumbers(
+            root,
+            setOf("level", "stage", "wave"),
+            maxDepth = 2,
+            minNumbers = 1,
+            maxNumbers = 2
+        )?.firstOrNull() ?: 1
 
     private fun extractMission(root: AccessibilityNodeInfo): MissionProgress? {
         val numbers = findStructuredNumbers(
             root,
             setOf("mission", "objective", "target", "goal", "task", "quest"),
             maxDepth = 3,
-            minNumbers = 2
+            minNumbers = 2,
+            maxNumbers = 4
         ) ?: return null
 
         return MissionProgress(
@@ -337,18 +371,20 @@ class BoardParser {
     }
 
     /**
-     * Search children first so the smallest subtree containing both a keyword and enough numbers
-     * wins. This avoids accidentally parsing the first tile number from an entire screen/root node.
+     * Search children first so the smallest subtree containing both a keyword and a plausible
+     * amount of numeric data wins. Reject number-heavy subtrees instead of guessing from unrelated
+     * tile/score values elsewhere on screen.
      */
     private fun findStructuredNumbers(
         node: AccessibilityNodeInfo,
         keywords: Set<String>,
         maxDepth: Int,
-        minNumbers: Int
+        minNumbers: Int,
+        maxNumbers: Int
     ): List<Int>? {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val childResult = findStructuredNumbers(child, keywords, maxDepth, minNumbers)
+            val childResult = findStructuredNumbers(child, keywords, maxDepth, minNumbers, maxNumbers)
             if (childResult != null) return childResult
         }
 
@@ -357,7 +393,7 @@ class BoardParser {
         if (keywords.none { lowercase.contains(it) }) return null
 
         val numbers = extractNumbers(subtreeText)
-        return numbers.takeIf { it.size >= minNumbers }
+        return numbers.takeIf { it.size in minNumbers..maxNumbers }
     }
 
     private fun extractNumbers(text: String): List<Int> {

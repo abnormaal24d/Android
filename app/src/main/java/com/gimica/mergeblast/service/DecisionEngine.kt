@@ -1,19 +1,15 @@
 package com.gimica.mergeblast.service
 
 import android.util.Log
-import com.gimica.mergeblast.service.MoveDecision
-import com.gimica.mergeblast.service.BoardState
-import com.gimica.mergeblast.service.Tile
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.random.Random
 
 class DecisionEngine {
     companion object {
         private const val TAG = "DecisionEngine"
-        private const val MAX_LOOKAHEAD_DEPTH = 3
-        private const val SIMULATION_TIME_BUDGET_MS = 50
+        private const val MAX_LOOKAHEAD_DEPTH = 5
+        private const val SIMULATION_TIME_BUDGET_MS = 45L
     }
 
     private var lastBoardHash = 0
@@ -44,7 +40,11 @@ class DecisionEngine {
     )
 
     fun decideMove(board: BoardState): MoveDecision {
-        val currentHash = board.tiles.hashCode()
+        if (!board.isStable()) {
+            return MoveDecision.wait("Board animation detected")
+        }
+
+        val currentHash = board.signature()
 
         if (currentHash == lastBoardHash) {
             stuckCounter++
@@ -82,54 +82,86 @@ class DecisionEngine {
             }
         }
 
-        Log.d(TAG, "Decision: ${decision.action} (conf=${String.format("%.2f", decision.confidence)}) - ${decision.reasoning}")
+        Log.d(
+            TAG,
+            "Decision: ${decision.action} (conf=${String.format("%.2f", decision.confidence)}) - ${decision.reasoning}"
+        )
         return decision
     }
 
-    private fun hasImmediateMerge(board: BoardState): Boolean =
-        board.getMergeablePairs().isNotEmpty()
+    private fun hasImmediateMerge(board: BoardState): Boolean = board.getMergeablePairs().isNotEmpty()
 
     private fun findBestMergeWithLookahead(board: BoardState): MoveDecision {
         val pairs = board.getMergeablePairs()
+        val deadline = System.nanoTime() + SIMULATION_TIME_BUDGET_MS * 1_000_000L
+        val maxDepth = adaptiveLookaheadDepth(board)
         var bestPair: Pair<Tile, Tile>? = null
         var bestScore = Int.MIN_VALUE
-        var bestReasoning = ""
 
         pairs.forEach { (t1, t2) ->
-            val score = evaluateMergeWithLookahead(t1, t2, board, 0)
+            val score = evaluateMergeWithLookahead(t1, t2, board, 0, maxDepth, deadline)
             if (score > bestScore) {
                 bestScore = score
                 bestPair = t1 to t2
-                bestReasoning = "Merge ${t1.value}+${t2.value}=${t1.value * 2} (lookahead score: $score)"
             }
         }
 
-        bestPair?.let { (t1, _) ->
-            return MoveDecision.tap(t1, bestReasoning).copy(confidence = 0.95f)
+        bestPair?.let { (t1, t2) ->
+            val reasoning = "Merge ${t1.value}+${t2.value}=${t1.value * 2} (depth=$maxDepth, score=$bestScore)"
+            return MoveDecision.tap(t1, reasoning).copy(confidence = confidenceForScore(bestScore))
         }
         return MoveDecision.wait("No valid merge found after evaluation")
     }
 
-    private fun evaluateMergeWithLookahead(t1: Tile, t2: Tile, board: BoardState, depth: Int): Int {
-        var score = evaluateMergeImmediate(t1, t2, board)
+    private fun adaptiveLookaheadDepth(board: BoardState): Int {
+        val capacity = (board.gridRows * board.gridCols).coerceAtLeast(1)
+        val emptyRatio = board.emptyCells.size.toFloat() / capacity
+        return when {
+            board.emptyCells.size <= 1 -> min(config.maxDepth, 5)
+            board.emptyCells.size <= 3 -> min(config.maxDepth, 4)
+            emptyRatio < 0.45f -> min(config.maxDepth, 3)
+            else -> min(config.maxDepth, 2)
+        }
+    }
 
-        if (depth < config.maxDepth) {
-            val simulatedBoard = board.simulateMerge(t1, t2)
-            val futurePairs = simulatedBoard.getMergeablePairs()
-            if (futurePairs.isNotEmpty()) {
-                val bestFuture = futurePairs.maxByOrNull { (ft1, ft2) ->
-                    evaluateMergeImmediate(ft1, ft2, simulatedBoard)
-                }
-                bestFuture?.let { (ft1, ft2) ->
-                    score += evaluateMergeWithLookahead(ft1, ft2, simulatedBoard, depth + 1) / 2
-                }
-            }
+    private fun evaluateMergeWithLookahead(
+        t1: Tile,
+        t2: Tile,
+        board: BoardState,
+        depth: Int,
+        maxDepth: Int,
+        deadlineNanos: Long
+    ): Int {
+        var score = evaluateMergeImmediate(t1, t2, board)
+        if (depth >= maxDepth || System.nanoTime() >= deadlineNanos) return score
+
+        val simulatedBoard = board.simulateMerge(t1, t2)
+        val futurePairs = simulatedBoard.getMergeablePairs()
+        if (futurePairs.isEmpty()) return score
+
+        var bestFuture = Int.MIN_VALUE
+        for ((ft1, ft2) in futurePairs) {
+            if (System.nanoTime() >= deadlineNanos) break
+            val futureScore = evaluateMergeWithLookahead(
+                ft1,
+                ft2,
+                simulatedBoard,
+                depth + 1,
+                maxDepth,
+                deadlineNanos
+            )
+            bestFuture = max(bestFuture, futureScore)
+        }
+
+        if (bestFuture != Int.MIN_VALUE) {
+            score += bestFuture / (depth + 2)
         }
         return score
     }
 
     private fun evaluateMergeImmediate(t1: Tile, t2: Tile, board: BoardState): Int {
         val newValue = t1.value * 2
+        val simulatedBoard = board.simulateMerge(t1, t2)
         var score = newValue * config.mergeWeight
 
         val mission = board.missionProgress
@@ -142,47 +174,72 @@ class DecisionEngine {
             }
         }
 
-        val emptyAfter = board.emptyCells.size + 1
-        score += emptyAfter * config.spaceWeight
-
-        val chainPotential = estimateChainPotential(t1, t2, board, newValue)
-        score += chainPotential * config.chainBonus
-
+        score += simulatedBoard.emptyCells.size * config.spaceWeight
+        score += estimateChainPotential(t1, t2, board, newValue) * config.chainBonus
         score += newValue * config.highValueBonus
 
-        val (r, c) = t2.row to t2.col
-        if (isCorner(r, c, board.gridRows, board.gridCols)) {
+        if (isCorner(t2.row, t2.col, board.gridRows, board.gridCols)) {
             score += config.cornerBonus * newValue
         }
 
-        score += evaluateBoardQuality(board, t1, t2, newValue)
-
+        score += evaluateBoardQuality(simulatedBoard)
         return score
     }
 
-    private fun evaluateBoardQuality(board: BoardState, t1: Tile, t2: Tile, newValue: Int): Int {
+    private fun evaluateBoardQuality(board: BoardState): Int {
         var quality = 0
+        quality += calculateMonotonicity(board.tiles, board.gridRows, board.gridCols) * config.monotonicityWeight
+        quality += calculateSmoothness(board.tiles, board.gridRows, board.gridCols) * config.smoothnessWeight
+        quality += board.emptyCells.size * config.spaceWeight
+        quality += board.getMergeablePairs().size * config.chainBonus
 
-        val simulatedTiles = board.tiles.toMutableList()
-        simulatedTiles.removeAll { it == t1 || it == t2 }
-        simulatedTiles.add(Tile(t2.row, t2.col, newValue, t2.bounds))
+        val highest = board.getHighestTile()
+        if (highest != null) {
+            if (isCorner(highest.row, highest.col, board.gridRows, board.gridCols)) {
+                quality += highest.value * config.cornerBonus
+            } else if (board.emptyCells.size <= 2) {
+                quality -= highest.value * config.cornerBonus
+            }
+        }
 
-        val monotonicity = calculateMonotonicity(simulatedTiles, board.gridRows, board.gridCols)
-        quality += monotonicity * config.monotonicityWeight
-
-        val smoothness = calculateSmoothness(simulatedTiles, board.gridRows, board.gridCols)
-        quality += smoothness * config.smoothnessWeight
-
-        val emptyCount = board.emptyCells.size + 1
-        quality += emptyCount * config.spaceWeight
-
+        quality -= boardRiskPenalty(board)
         return quality
+    }
+
+    private fun boardRiskPenalty(board: BoardState): Int {
+        val capacity = (board.gridRows * board.gridCols).coerceAtLeast(1)
+        val empty = board.emptyCells.size
+        val mobility = board.tiles.count { board.getEmptyNeighbors(it).isNotEmpty() } + board.getMergeablePairs().size
+
+        var penalty = when (empty) {
+            0 -> 8000
+            1 -> 4000
+            2 -> 1800
+            3 -> 700
+            else -> 0
+        }
+
+        if (mobility <= 1) penalty += 2500
+        if (board.tiles.size >= capacity && board.getMergeablePairs().isEmpty()) penalty += 10000
+        return penalty
+    }
+
+    private fun confidenceForScore(score: Int): Float = when {
+        score > 50_000 -> 0.98f
+        score > 20_000 -> 0.94f
+        score > 5_000 -> 0.88f
+        score > 0 -> 0.78f
+        else -> 0.55f
     }
 
     private fun calculateMonotonicity(tiles: List<Tile>, rows: Int, cols: Int): Int {
         var total = 0
         val grid = Array(rows) { Array(cols) { 0 } }
-        tiles.forEach { grid[it.row][it.col] = it.value }
+        tiles.forEach { tile ->
+            if (tile.row in 0 until rows && tile.col in 0 until cols) {
+                grid[tile.row][tile.col] = tile.value
+            }
+        }
 
         for (r in 0 until rows) {
             var increasing = 0
@@ -195,7 +252,7 @@ class DecisionEngine {
                     else if (curr < prev) decreasing += prev - curr
                 }
             }
-            total += max(increasing, decreasing)
+            total += min(increasing, decreasing)
         }
 
         for (c in 0 until cols) {
@@ -209,7 +266,7 @@ class DecisionEngine {
                     else if (curr < prev) decreasing += prev - curr
                 }
             }
-            total += max(increasing, decreasing)
+            total += min(increasing, decreasing)
         }
         return -total
     }
@@ -217,15 +274,18 @@ class DecisionEngine {
     private fun calculateSmoothness(tiles: List<Tile>, rows: Int, cols: Int): Int {
         var total = 0
         val grid = Array(rows) { Array(cols) { 0 } }
-        tiles.forEach { grid[it.row][it.col] = it.value }
+        tiles.forEach { tile ->
+            if (tile.row in 0 until rows && tile.col in 0 until cols) {
+                grid[tile.row][tile.col] = tile.value
+            }
+        }
 
         for (r in 0 until rows) {
             for (c in 0 until cols) {
-                val v = grid[r][c]
-                if (v > 0) {
-                    if (c + 1 < cols && grid[r][c + 1] > 0) total -= abs(v - grid[r][c + 1])
-                    if (r + 1 < rows && grid[r + 1][c] > 0) total -= abs(v - grid[r + 1][c])
-                }
+                val value = grid[r][c]
+                if (value <= 0) continue
+                if (c + 1 < cols && grid[r][c + 1] > 0) total -= abs(value - grid[r][c + 1])
+                if (r + 1 < rows && grid[r + 1][c] > 0) total -= abs(value - grid[r + 1][c])
             }
         }
         return total
@@ -236,18 +296,13 @@ class DecisionEngine {
         val targetPos = t2.row to t2.col
 
         board.tiles.filter { it.value == newValue && it != t1 && it != t2 }.forEach { neighbor ->
-            if (areAdjacent(targetPos, neighbor.row to neighbor.col)) {
-                potential++
-            }
+            if (areAdjacent(targetPos, neighbor.row to neighbor.col)) potential++
         }
 
         val futureValue = newValue * 2
         board.tiles.filter { it.value == futureValue }.forEach { neighbor ->
-            if (areAdjacent(targetPos, neighbor.row to neighbor.col)) {
-                potential += 2
-            }
+            if (areAdjacent(targetPos, neighbor.row to neighbor.col)) potential += 2
         }
-
         return potential
     }
 
@@ -257,31 +312,34 @@ class DecisionEngine {
         return (abs(r1 - r2) == 1 && c1 == c2) || (abs(c1 - c2) == 1 && r1 == r2)
     }
 
-    private fun isCorner(row: Int, col: Int, rows: Int, cols: Int): Boolean {
-        return (row == 0 || row == rows - 1) && (col == 0 || col == cols - 1)
-    }
+    private fun isCorner(row: Int, col: Int, rows: Int, cols: Int): Boolean =
+        (row == 0 || row == rows - 1) && (col == 0 || col == cols - 1)
 
     private fun hasMissionTarget(board: BoardState): Boolean {
-        val m = board.missionProgress ?: return false
-        return m.mergeCountTarget > 0 || m.existAmountTarget > 0
+        val mission = board.missionProgress ?: return false
+        return mission.mergeCountTarget > 0 || mission.existAmountTarget > 0
     }
 
     private fun findMissionMove(board: BoardState): MoveDecision {
-        val m = board.missionProgress!!
+        val mission = board.missionProgress!!
 
-        if (m.existAmountTarget > 0) {
-            val targetTiles = board.tiles.filter { it.value >= m.existAmountValue }
+        if (mission.existAmountTarget > 0) {
+            val targetTiles = board.tiles.filter { it.value >= mission.existAmountValue }
             if (targetTiles.isNotEmpty()) {
-                val best = targetTiles.maxByOrNull { it.value }
-                return MoveDecision.tap(best!!, "Mission: build ${m.existAmountValue}+ tile").copy(confidence = 0.9f)
+                val best = targetTiles.maxByOrNull { it.value }!!
+                return MoveDecision.tap(best, "Mission: build ${mission.existAmountValue}+ tile")
+                    .copy(confidence = 0.9f)
             }
         }
 
-        if (m.mergeCountCurrent < m.mergeCountTarget) {
+        if (mission.mergeCountCurrent < mission.mergeCountTarget) {
             val pairs = board.getMergeablePairs()
-            if (pairs.isNotEmpty()) {
-                val best = pairs.maxByOrNull { (t1, t2) -> evaluateMergeImmediate(t1, t2, board) }
-                best?.let { (t1, _) -> return MoveDecision.tap(t1, "Mission: merge for count (${m.mergeCountCurrent}/${m.mergeCountTarget})").copy(confidence = 0.85f) }
+            val best = pairs.maxByOrNull { (t1, t2) -> evaluateMergeImmediate(t1, t2, board) }
+            best?.let { (t1, _) ->
+                return MoveDecision.tap(
+                    t1,
+                    "Mission: merge for count (${mission.mergeCountCurrent}/${mission.mergeCountTarget})"
+                ).copy(confidence = 0.85f)
             }
         }
 
@@ -293,64 +351,58 @@ class DecisionEngine {
 
     private fun findSpaceCreatingMove(board: BoardState): MoveDecision {
         val pairs = board.getMergeablePairs()
-        pairs.maxByOrNull { (t1, t2) ->
-            val emptyAfter = board.emptyCells.size + 1
-            evaluateMergeImmediate(t1, t2, board) + emptyAfter * 100
-        }?.let { (t1, _) ->
-            return MoveDecision.tap(t1, "Create space via merge").copy(confidence = 0.8f)
-        }
+        pairs.maxByOrNull { (t1, t2) -> evaluateMergeImmediate(t1, t2, board) }
+            ?.let { (t1, _) ->
+                return MoveDecision.tap(t1, "Create space via merge").copy(confidence = 0.8f)
+            }
 
         val movableTiles = board.tiles.filter { board.getEmptyNeighbors(it).isNotEmpty() }
         movableTiles.maxByOrNull { it.value }?.let { tile ->
-            val empty = board.getEmptyNeighbors(tile).first()
-            return MoveDecision.swipe(tile.centerX, tile.centerY, empty.second, empty.first, "Move high tile to create space").copy(confidence = 0.6f)
+            val (row, col) = board.getEmptyNeighbors(tile).first()
+            return MoveDecision.swipe(tile, row, col, "Move high tile to create space")
+                .copy(confidence = 0.6f)
         }
 
         return MoveDecision.wait("No space-creating move found")
     }
 
     private fun findStrategicMove(board: BoardState): MoveDecision {
-        val pairs = board.getMergeablePairs()
-        if (pairs.isNotEmpty()) {
-            return findBestMergeWithLookahead(board)
-        }
+        if (board.getMergeablePairs().isNotEmpty()) return findBestMergeWithLookahead(board)
 
         val highTiles = board.tiles.filter { it.value >= 128 }.sortedByDescending { it.value }
         highTiles.firstOrNull()?.let { tile ->
-            val emptyNeighbors = board.getEmptyNeighbors(tile)
-            if (emptyNeighbors.isNotEmpty()) {
-                val target = emptyNeighbors.minByOrNull { (r, c) -> distanceToCorner(r, c, board.gridRows, board.gridCols) }
-                target?.let { (r, c) ->
-                    return MoveDecision.swipe(tile.centerX, tile.centerY, c, r, "Position high tile toward corner").copy(confidence = 0.5f)
-                }
+            val target = board.getEmptyNeighbors(tile)
+                .minByOrNull { (r, c) -> distanceToCorner(r, c, board.gridRows, board.gridCols) }
+            target?.let { (row, col) ->
+                return MoveDecision.swipe(tile, row, col, "Position high tile toward corner")
+                    .copy(confidence = 0.5f)
             }
         }
 
         return findExploratoryMove(board)
     }
 
-    private fun distanceToCorner(r: Int, c: Int, rows: Int, cols: Int): Int {
-        return min(
-            min(r + c, r + (cols - 1 - c)),
-            min((rows - 1 - r) + c, (rows - 1 - r) + (cols - 1 - c))
-        )
-    }
+    private fun distanceToCorner(r: Int, c: Int, rows: Int, cols: Int): Int = min(
+        min(r + c, r + (cols - 1 - c)),
+        min((rows - 1 - r) + c, (rows - 1 - r) + (cols - 1 - c))
+    )
 
     private fun findExploratoryMove(board: BoardState): MoveDecision {
-        val movableTiles = board.tiles.filter { board.getEmptyNeighbors(it).isNotEmpty() }
+        val movableTiles = board.tiles
+            .filter { board.getEmptyNeighbors(it).isNotEmpty() }
             .sortedByDescending { it.value }
 
         movableTiles.firstOrNull()?.let { tile ->
-            val empty = board.getEmptyNeighbors(tile).shuffled().first()
-            return MoveDecision.swipe(tile.centerX, tile.centerY, empty.second, empty.first, "Exploratory move: ${tile.value}").copy(confidence = 0.3f)
+            val (row, col) = board.getEmptyNeighbors(tile).shuffled().first()
+            return MoveDecision.swipe(tile, row, col, "Exploratory move: ${tile.value}")
+                .copy(confidence = 0.3f)
         }
 
         val anyTile = board.tiles.shuffled().firstOrNull()
-        anyTile?.let { tile ->
-            val empty = board.emptyCells.shuffled().firstOrNull()
-            empty?.let { (r, c) ->
-                return MoveDecision.swipe(tile.centerX, tile.centerY, c, r, "Desperation move").copy(confidence = 0.1f)
-            }
+        val empty = board.emptyCells.shuffled().firstOrNull()
+        if (anyTile != null && empty != null) {
+            return MoveDecision.swipe(anyTile, empty.first, empty.second, "Desperation move")
+                .copy(confidence = 0.1f)
         }
 
         return MoveDecision.wait("Completely stuck - no moves possible")

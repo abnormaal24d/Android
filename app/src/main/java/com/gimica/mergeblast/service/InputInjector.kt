@@ -24,33 +24,35 @@ class InputInjector(private val service: AccessibilityService) {
     private var lastTapTime = 0L
     private var lastSwipeTime = 0L
 
-    fun performAction(decision: MoveDecision, board: BoardState): Boolean = when (decision.action) {
-        MoveDecision.Action.TAP -> {
-            val tile = decision.sourceTile ?: return false
-            performTap(tile.centerX, tile.centerY)
-        }
-
-        MoveDecision.Action.SWIPE -> {
-            val tile = decision.sourceTile ?: return false
-            val target = board.estimateCellCenter(decision.targetRow, decision.targetCol, tile)
-            if (target == null) {
-                Log.w(
-                    TAG,
-                    "Cannot resolve target cell (${decision.targetRow},${decision.targetCol}) for ${tile.row},${tile.col}"
-                )
-                false
-            } else {
-                val (targetX, targetY) = target
-                Log.d(
-                    TAG,
-                    "Resolved swipe cell (${decision.targetRow},${decision.targetCol}) to ($targetX,$targetY)"
-                )
-                performSwipe(tile.centerX, tile.centerY, targetX, targetY)
+    fun performAction(decision: MoveDecision, board: BoardState): Boolean {
+        return when (decision.action) {
+            MoveDecision.Action.TAP -> {
+                val tile = decision.sourceTile ?: return false
+                performTap(tile.centerX, tile.centerY)
             }
-        }
 
-        MoveDecision.Action.WAIT,
-        MoveDecision.Action.NONE -> true
+            MoveDecision.Action.SWIPE -> {
+                val tile = decision.sourceTile ?: return false
+                val target = board.estimateCellCenter(decision.targetRow, decision.targetCol, tile)
+                if (target == null) {
+                    Log.w(
+                        TAG,
+                        "Cannot resolve target cell (${decision.targetRow},${decision.targetCol}) for ${tile.row},${tile.col}"
+                    )
+                    false
+                } else {
+                    val (targetX, targetY) = target
+                    Log.d(
+                        TAG,
+                        "Resolved swipe cell (${decision.targetRow},${decision.targetCol}) to ($targetX,$targetY)"
+                    )
+                    performSwipe(tile.centerX, tile.centerY, targetX, targetY)
+                }
+            }
+
+            MoveDecision.Action.WAIT,
+            MoveDecision.Action.NONE -> true
+        }
     }
 
     fun performTap(x: Int, y: Int): Boolean {

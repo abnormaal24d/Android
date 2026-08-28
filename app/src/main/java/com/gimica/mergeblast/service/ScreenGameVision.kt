@@ -30,6 +30,7 @@ class ScreenBoardParser {
     }
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val adScreenDetector = AdScreenDetector()
 
     fun parse(
         bitmap: Bitmap,
@@ -55,20 +56,42 @@ class ScreenBoardParser {
         val input = InputImage.fromBitmap(cropped, 0)
         recognizer.process(input)
             .addOnSuccessListener { result ->
-                try {
-                    onSuccess(parseResult(result, bitmap.width, bitmap.height, cropTop))
-                } finally {
-                    if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                val state = parseResult(result, bitmap.width, bitmap.height, cropTop)
+                if (state != null) {
+                    AdAutoCloser.onGameVisible()
+                    onSuccess(state)
+                } else {
+                    // Normal game parsing deliberately ignores the ad/CTA areas for speed. Only
+                    // when no playable board is found do a second full-screen OCR pass to determine
+                    // whether an interstitial is blocking the game and close it automatically.
+                    val service = GameAccessibilityService.getInstance()
+                    if (service == null) {
+                        onSuccess(null)
+                    } else {
+                        adScreenDetector.inspect(
+                            bitmap,
+                            onSuccess = { adResult ->
+                                AdAutoCloser.handle(adResult, service)
+                                onSuccess(null)
+                            },
+                            onFailure = {
+                                // Ad detection is best-effort. A failed secondary OCR must never
+                                // break the main gameplay loop.
+                                onSuccess(null)
+                            }
+                        )
+                    }
                 }
             }
-            .addOnFailureListener { error ->
+            .addOnFailureListener { error -> onFailure(error) }
+            .addOnCompleteListener {
                 if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
-                onFailure(error)
             }
     }
 
     fun close() {
         recognizer.close()
+        adScreenDetector.close()
     }
 
     private fun parseResult(result: Text, width: Int, height: Int, yOffset: Int): ScreenGameState? {

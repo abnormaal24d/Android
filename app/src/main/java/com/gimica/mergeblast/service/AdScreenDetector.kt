@@ -16,28 +16,25 @@ import java.util.ArrayDeque
 import kotlin.math.abs
 
 /**
- * Fast interstitial detector. Gameplay OCR has already failed before this class is called.
+ * Conservative interstitial detector.
  *
- * The detector has two tiers:
- * 1. A very cheap pixel scan for the graphical white X/circle used by many ad SDKs.
- * 2. OCR of only the top-control and lower-CTA bands for Close/Skip/Install/Play Now evidence.
- *
- * This avoids OCRing the moving video body unless there is no usable graphical close control.
+ * Gameplay/menu recognition has already failed before this class is called. The detector may close
+ * an ad, but it must never tap the creative/CTA. Explicit taps are therefore restricted to a small
+ * upper-right safe zone. Anything else is handled with Android Back.
  */
 class AdScreenDetector {
     companion object {
-        private const val TOP_ROI_FRACTION = 0.24f
-
-        // Some interstitials place PLAY NOW around 55-65% of the screen, not at the very bottom.
-        // Start the lower OCR band high enough to include those CTAs without doing full-screen OCR.
+        private const val TOP_ROI_FRACTION = 0.26f
         private const val BOTTOM_ROI_FRACTION = 0.46f
 
+        // Visual close detection is intentionally right-side only. A left countdown/icon must never
+        // be mistaken for a close button.
         private const val VISUAL_CLOSE_TOP_START = 0.02f
         private const val VISUAL_CLOSE_TOP_END = 0.20f
-        private const val VISUAL_CLOSE_EDGE_FRACTION = 0.24f
+        private const val VISUAL_CLOSE_RIGHT_START = 0.80f
 
         private val AD_CTA_MARKERS = listOf(
-            "installeren", "install", "download", "get app", "get the app", "get",
+            "installeren", "install", "download", "get app", "get the app",
             "play now", "speel nu", "open app", "openen", "app store", "google play"
         )
 
@@ -67,16 +64,14 @@ class AdScreenDetector {
         val width = bitmap.width
         val height = bitmap.height
 
-        // Many rewarded/interstitial ads draw the X as graphics, so ML Kit never returns an "x".
-        // Detect that control directly. Because normal board parsing and game-menu navigation have
-        // already failed, a strong close glyph in the extreme top corner is enough evidence.
+        // Strongest and cheapest path: a real graphical X in the upper-right safe zone.
         detectVisualCornerClose(bitmap)?.let { closePoint ->
             onSuccess(
                 AdVisualResult(
                     isAd = true,
                     strongEvidence = true,
                     closePoint = closePoint,
-                    recognizedText = "visual-corner-close",
+                    recognizedText = "visual-upper-right-close",
                     screenWidth = width,
                     screenHeight = height
                 )
@@ -117,7 +112,7 @@ class AdScreenDetector {
                 val hasAdContext = AD_CONTEXT_MARKERS.any(normalizedText::contains)
 
                 var hasCountdown = false
-                val closeBounds = ArrayList<Rect>(2)
+                var closePoint: Point? = null
 
                 for (block in text.textBlocks) {
                     for (line in block.lines) {
@@ -128,28 +123,24 @@ class AdScreenDetector {
 
                             if (!hasCountdown &&
                                 label.matches(Regex("\\d{1,2}")) &&
-                                original.centerY() < height * 0.22f &&
-                                (original.centerX() < width * 0.28f || original.centerX() > width * 0.72f)
+                                original.centerY() < height * 0.22f
                             ) {
                                 hasCountdown = true
                             }
 
                             if (isCloseLabel(label, original, width, height)) {
-                                closeBounds += original
+                                val candidate = Point(original.centerX(), original.centerY())
+                                if (isSafeExplicitClosePoint(candidate, width, height)) {
+                                    closePoint = candidate
+                                    break
+                                }
                             }
                         }
+                        if (closePoint != null) break
                     }
+                    if (closePoint != null) break
                 }
 
-                val closePoint = closeBounds
-                    .minWithOrNull(
-                        compareBy<Rect> { if (it.centerY() < height / 2) 0 else 1 }
-                            .thenByDescending { it.centerX() }
-                    )
-                    ?.let { Point(it.centerX(), it.centerY()) }
-
-                // A corner close control plus a short countdown is a classic rewarded-ad layout
-                // even when the creative itself contains no words such as "advertisement".
                 val closeWithCountdown = closePoint != null && hasCountdown
                 val isAd = hasCta || hasAdContext || closeWithCountdown
 
@@ -175,9 +166,8 @@ class AdScreenDetector {
     }
 
     /**
-     * Finds a white/near-white square-ish glyph in either extreme top corner. This catches the
-     * common circled-X close button that OCR sees only as pixels. The constraints intentionally
-     * reject narrow countdown digits and large CTA rectangles.
+     * Finds a neutral-white square-ish close glyph only in the upper-right corner. This is stricter
+     * than previous versions because a false positive inside an ad creative can open the store.
      */
     private fun detectVisualCornerClose(bitmap: Bitmap): Point? {
         val width = bitmap.width
@@ -187,108 +177,98 @@ class AdScreenDetector {
 
         val yStart = (height * VISUAL_CLOSE_TOP_START).toInt().coerceIn(0, height - 1)
         val yEnd = (height * VISUAL_CLOSE_TOP_END).toInt().coerceIn(yStart + 1, height)
-        val edgeWidth = (width * VISUAL_CLOSE_EDGE_FRACTION).toInt().coerceIn(1, width / 2)
+        val regionLeft = (width * VISUAL_CLOSE_RIGHT_START).toInt().coerceIn(0, width - 1)
+        val regionRight = width
+        val regionWidth = regionRight - regionLeft
+        val regionHeight = yEnd - yStart
+        if (regionWidth <= 0 || regionHeight <= 0) return null
+
         val minSide = (minDimension * 0.018f).toInt().coerceAtLeast(10)
         val maxSide = (minDimension * 0.095f).toInt().coerceAtLeast(minSide + 1)
+        val count = regionWidth * regionHeight
+        val pixels = IntArray(count)
+        bitmap.getPixels(pixels, 0, regionWidth, regionLeft, yStart, regionWidth, regionHeight)
 
+        val bright = BooleanArray(count)
+        for (index in pixels.indices) {
+            val color = pixels[index]
+            val red = color ushr 16 and 0xff
+            val green = color ushr 8 and 0xff
+            val blue = color and 0xff
+            val maxChannel = maxOf(red, green, blue)
+            val minChannel = minOf(red, green, blue)
+            bright[index] = red >= 218 && green >= 218 && blue >= 218 &&
+                maxChannel - minChannel <= 36
+        }
+
+        val visited = BooleanArray(count)
+        val stack = IntArray(count)
         var bestPoint: Point? = null
         var bestScore = Float.NEGATIVE_INFINITY
 
-        fun scanRegion(regionLeft: Int, regionRight: Int) {
-            val regionWidth = regionRight - regionLeft
-            val regionHeight = yEnd - yStart
-            if (regionWidth <= 0 || regionHeight <= 0) return
+        for (start in 0 until count) {
+            if (!bright[start] || visited[start]) continue
 
-            val count = regionWidth * regionHeight
-            val pixels = IntArray(count)
-            bitmap.getPixels(pixels, 0, regionWidth, regionLeft, yStart, regionWidth, regionHeight)
+            var stackSize = 0
+            stack[stackSize++] = start
+            visited[start] = true
 
-            val bright = BooleanArray(count)
-            for (index in pixels.indices) {
-                val color = pixels[index]
-                val red = color ushr 16 and 0xff
-                val green = color ushr 8 and 0xff
-                val blue = color and 0xff
-                val maxChannel = maxOf(red, green, blue)
-                val minChannel = minOf(red, green, blue)
+            var area = 0
+            var minX = regionWidth
+            var maxX = -1
+            var minY = regionHeight
+            var maxY = -1
 
-                // Close controls are usually neutral white/gray. Requiring low channel spread
-                // rejects saturated game/ad artwork while retaining anti-aliased white strokes.
-                bright[index] = red >= 210 && green >= 210 && blue >= 210 &&
-                    maxChannel - minChannel <= 45
-            }
+            while (stackSize > 0) {
+                val current = stack[--stackSize]
+                val localY = current / regionWidth
+                val localX = current - localY * regionWidth
+                area++
+                if (localX < minX) minX = localX
+                if (localX > maxX) maxX = localX
+                if (localY < minY) minY = localY
+                if (localY > maxY) maxY = localY
 
-            val visited = BooleanArray(count)
-            val stack = IntArray(count)
-
-            for (start in 0 until count) {
-                if (!bright[start] || visited[start]) continue
-
-                var stackSize = 0
-                stack[stackSize++] = start
-                visited[start] = true
-
-                var area = 0
-                var minX = regionWidth
-                var maxX = -1
-                var minY = regionHeight
-                var maxY = -1
-
-                while (stackSize > 0) {
-                    val current = stack[--stackSize]
-                    val localY = current / regionWidth
-                    val localX = current - localY * regionWidth
-                    area++
-                    if (localX < minX) minX = localX
-                    if (localX > maxX) maxX = localX
-                    if (localY < minY) minY = localY
-                    if (localY > maxY) maxY = localY
-
-                    for (dy in -1..1) {
-                        val nextY = localY + dy
-                        if (nextY !in 0 until regionHeight) continue
-                        for (dx in -1..1) {
-                            if (dx == 0 && dy == 0) continue
-                            val nextX = localX + dx
-                            if (nextX !in 0 until regionWidth) continue
-                            val next = nextY * regionWidth + nextX
-                            if (bright[next] && !visited[next]) {
-                                visited[next] = true
-                                stack[stackSize++] = next
-                            }
+                for (dy in -1..1) {
+                    val nextY = localY + dy
+                    if (nextY !in 0 until regionHeight) continue
+                    for (dx in -1..1) {
+                        if (dx == 0 && dy == 0) continue
+                        val nextX = localX + dx
+                        if (nextX !in 0 until regionWidth) continue
+                        val next = nextY * regionWidth + nextX
+                        if (bright[next] && !visited[next]) {
+                            visited[next] = true
+                            stack[stackSize++] = next
                         }
                     }
                 }
+            }
 
-                if (maxX < minX || maxY < minY) continue
-                val componentWidth = maxX - minX + 1
-                val componentHeight = maxY - minY + 1
-                if (componentWidth !in minSide..maxSide || componentHeight !in minSide..maxSide) continue
+            if (maxX < minX || maxY < minY) continue
+            val componentWidth = maxX - minX + 1
+            val componentHeight = maxY - minY + 1
+            if (componentWidth !in minSide..maxSide || componentHeight !in minSide..maxSide) continue
 
-                val aspect = componentWidth.toFloat() / componentHeight.toFloat()
-                if (aspect !in 0.58f..1.72f) continue
+            val aspect = componentWidth.toFloat() / componentHeight.toFloat()
+            if (aspect !in 0.70f..1.43f) continue
 
-                val fillRatio = area.toFloat() / (componentWidth * componentHeight).toFloat()
-                if (fillRatio !in 0.06f..0.58f) continue
+            val fillRatio = area.toFloat() / (componentWidth * componentHeight).toFloat()
+            if (fillRatio !in 0.07f..0.52f) continue
 
-                val centerX = regionLeft + (minX + maxX) / 2
-                val centerY = yStart + (minY + maxY) / 2
-                val isExtremeCorner = centerX < width * 0.22f || centerX > width * 0.78f
-                if (!isExtremeCorner) continue
+            val centerX = regionLeft + (minX + maxX) / 2
+            val centerY = yStart + (minY + maxY) / 2
+            val candidate = Point(centerX, centerY)
+            if (!isSafeExplicitClosePoint(candidate, width, height)) continue
 
-                // Prefer larger, square-ish outlined glyphs. On the supplied interstitial this
-                // selects the 38x38 circled X rather than the small countdown digit.
-                val squarenessPenalty = abs(componentWidth - componentHeight) * 8f
-                val score = area + minOf(componentWidth, componentHeight) * 6f - squarenessPenalty
-                if (score > bestScore) {
-                    bestScore = score
-                    bestPoint = Point(centerX, centerY)
-                }
+            val squarenessPenalty = abs(componentWidth - componentHeight) * 10f
+            val score = area + minOf(componentWidth, componentHeight) * 7f - squarenessPenalty
+            if (score > bestScore) {
+                bestScore = score
+                bestPoint = candidate
             }
         }
 
-        scanRegion(0, edgeWidth)
-        scanRegion(width - edgeWidth, width)
         return bestPoint
     }
 
@@ -303,12 +283,15 @@ class AdScreenDetector {
         val exact = CLOSE_MARKERS.any { marker -> label == marker || label.startsWith("$marker ") }
         if (!exact) return false
 
-        if (label == "x") {
-            return bounds.centerY() < height * 0.32f &&
-                (bounds.centerX() < width * 0.28f || bounds.centerX() > width * 0.72f)
-        }
-        return true
+        // Even textual close controls are only trusted in the upper area. This prevents subtitles,
+        // creative text or a CTA from becoming a tap target.
+        return bounds.centerY() < height * 0.30f && bounds.centerX() > width * 0.62f
     }
+
+    private fun isSafeExplicitClosePoint(point: Point, width: Int, height: Int): Boolean =
+        point.x > width * 0.78f &&
+            point.y > height * 0.01f &&
+            point.y < height * 0.22f
 }
 
 data class AdVisualResult(
@@ -321,32 +304,35 @@ data class AdVisualResult(
 )
 
 /**
- * Stateful interstitial closer. Never taps an install/download CTA. Fast path is Accessibility,
- * then an explicit visual/OCR close control, then Android Back, then a guarded corner probe.
+ * Stateful interstitial closer. Explicit taps are allowed only for validated upper-right close
+ * points. There is intentionally no blind corner tap fallback: Back is safer than opening an ad.
  */
 object AdAutoCloser {
-    // One gameplay screenshot arrives roughly every 340ms. Keep generic actions to one per frame.
     private const val ACTION_COOLDOWN_MS = 340L
-
-    // An explicitly located close control is safer than Back or a blind corner probe. It may be
-    // used sooner when an X appears immediately after a previous failed Back attempt.
     private const val EXPLICIT_CLOSE_COOLDOWN_MS = 180L
     private const val WEAK_BACK_DELAY_MS = 520L
-    private const val CORNER_FALLBACK_DELAY_MS = 1_800L
     private const val FAST_TAP_MS = 20L
+    private const val MAX_AD_SESSION_MS = 20_000L
+    private const val EXTERNAL_RECOVERY_COOLDOWN_MS = 450L
+
+    private const val PLAY_STORE_PACKAGE = "com.android.vending"
 
     private var adDetectedAt = 0L
     private var lastActionAt = 0L
     private var fallbackAttempts = 0
 
     @Synchronized
-    fun isActive(): Boolean = adDetectedAt != 0L
+    fun isActive(): Boolean {
+        expireOldSession(SystemClock.uptimeMillis())
+        return adDetectedAt != 0L
+    }
 
     /** Cheap path used before secondary OCR. */
     @Synchronized
     fun tryFastAccessibility(service: GameAccessibilityService): String? {
         val scan = scanAccessibility(service.rootInActiveWindow)
         val now = SystemClock.uptimeMillis()
+        expireOldSession(now)
 
         scan.closeNode?.let { closeNode ->
             markDetected(now)
@@ -364,7 +350,7 @@ object AdAutoCloser {
             lastActionAt = now
             fallbackAttempts++
             return if (accepted) {
-                "Advertentie: CTA herkend, direct Android Terug"
+                "Advertentie: CTA herkend, Android Terug"
             } else {
                 "Advertentie via Accessibility herkend; wachten op sluitknop"
             }
@@ -377,6 +363,7 @@ object AdAutoCloser {
         if (!result.isAd) return null
 
         val now = SystemClock.uptimeMillis()
+        expireOldSession(now)
         markDetected(now)
 
         scanAccessibility(service.rootInActiveWindow).closeNode?.let { closeNode ->
@@ -386,14 +373,13 @@ object AdAutoCloser {
             }
         }
 
-        // Explicitly located X/Close is the safest action. Do it before the generic cooldown so a
-        // newly appeared close button is not delayed by a Back attempt from the previous frame.
         result.closePoint?.let { point ->
-            if (now - lastActionAt >= EXPLICIT_CLOSE_COOLDOWN_MS &&
+            if (isSafeExplicitClosePoint(result, point) &&
+                now - lastActionAt >= EXPLICIT_CLOSE_COOLDOWN_MS &&
                 dispatchTap(service, point.x, point.y)
             ) {
                 lastActionAt = now
-                return "Advertentie: expliciete X/sluitknop aangetikt"
+                return "Advertentie: veilige X rechtsboven aangetikt"
             }
         }
 
@@ -410,33 +396,58 @@ object AdAutoCloser {
             if (accepted) return "Advertentie: Android Terug gestuurd"
         }
 
-        if (age >= CORNER_FALLBACK_DELAY_MS && fallbackAttempts >= 2 && fallbackAttempts % 2 == 0) {
-            // Blind probing is deliberately a last resort. The graphical detector above is preferred
-            // whenever an actual corner X is visible.
-            val x = (result.screenWidth * 0.955f).toInt()
-            val y = (result.screenHeight * 0.095f).toInt()
-            if (dispatchTap(service, x, y)) {
-                lastActionAt = now
-                fallbackAttempts++
-                return "Advertentie: top-rechts X-zone geprobeerd"
-            }
+        return "Advertentie gedetecteerd; wachten op veilige X/Back"
+    }
+
+    /**
+     * If an ad accidentally/externally opens the Play Store, immediately return to the game. This
+     * is active only during the short ad session, so manually opening Play Store later is untouched.
+     */
+    @Synchronized
+    fun recoverExternalLanding(service: GameAccessibilityService, foregroundPackage: String?): String? {
+        val now = SystemClock.uptimeMillis()
+        expireOldSession(now)
+        if (adDetectedAt == 0L) return null
+        if (foregroundPackage != PLAY_STORE_PACKAGE) return null
+        if (now - lastActionAt < EXTERNAL_RECOVERY_COOLDOWN_MS) {
+            return "Advertentie opende Google Play; herstel in cooldown"
         }
 
-        return "Advertentie gedetecteerd; sluitknop/countdown afwachten"
+        val accepted = service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        lastActionAt = now
+        fallbackAttempts++
+        return if (accepted) {
+            "Advertentie opende Google Play; automatisch terug naar spel"
+        } else {
+            "Google Play-landingskaart gedetecteerd; Back nog niet beschikbaar"
+        }
     }
 
     @Synchronized
     fun onGameVisible() {
-        adDetectedAt = 0L
-        lastActionAt = 0L
-        fallbackAttempts = 0
+        clearSession()
     }
+
+    private fun isSafeExplicitClosePoint(result: AdVisualResult, point: Point): Boolean =
+        point.x > result.screenWidth * 0.78f &&
+            point.y > result.screenHeight * 0.01f &&
+            point.y < result.screenHeight * 0.22f
 
     private fun markDetected(now: Long) {
         if (adDetectedAt == 0L) {
             adDetectedAt = now
             fallbackAttempts = 0
         }
+    }
+
+    private fun expireOldSession(now: Long) {
+        if (adDetectedAt != 0L && now - adDetectedAt > MAX_AD_SESSION_MS) clearSession()
+    }
+
+    private fun clearSession() {
+        adDetectedAt = 0L
+        lastActionAt = 0L
+        fallbackAttempts = 0
     }
 
     private data class AccessibilityScan(
@@ -456,9 +467,7 @@ object AdAutoCloser {
             visited++
             val label = nodeLabel(node)
 
-            if (isAccessibilityCloseLabel(node, label)) {
-                return AccessibilityScan(node, true)
-            }
+            if (isAccessibilityCloseLabel(node, label)) return AccessibilityScan(node, true)
             if (!adEvidence && isAdEvidenceLabel(label)) adEvidence = true
 
             for (index in 0 until node.childCount) {
@@ -492,34 +501,49 @@ object AdAutoCloser {
 
     private fun isAccessibilityCloseLabel(node: AccessibilityNodeInfo, label: String): Boolean {
         if (label.isBlank()) return false
-        val normalClose = label == "sluiten" ||
+        val looksClose = label == "sluiten" ||
             label == "overslaan" ||
             label == "skip" ||
             label == "skip ad" ||
             label == "dismiss" ||
             label == "done" ||
             label == "klaar" ||
-            label == "×" || label == "✕" || label == "✖" ||
+            label == "×" || label == "✕" || label == "✖" || label == "x" ||
             label.contains("close ad") ||
             label.contains("close button") ||
             label.contains("ad sluiten")
-        if (normalClose) return true
+        if (!looksClose) return false
 
-        if (label != "x") return false
+        // Require the Accessibility close node itself to live in the upper-right area. This guards
+        // against mislabeled creative/CTA nodes whose clickable parent covers most of the ad.
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         val root = node.window?.root ?: return false
         val rootBounds = Rect().also(root::getBoundsInScreen)
         if (rootBounds.width() <= 0 || rootBounds.height() <= 0) return false
-        return bounds.centerY() < rootBounds.top + rootBounds.height() * 0.34f &&
-            bounds.centerX() > rootBounds.left + rootBounds.width() * 0.70f
+
+        return bounds.centerY() < rootBounds.top + rootBounds.height() * 0.30f &&
+            bounds.centerX() > rootBounds.left + rootBounds.width() * 0.62f
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
+        // Clicking a huge parent can hit the ad creative. Only climb while the candidate remains a
+        // compact upper control instead of taking an arbitrary clickable ancestor.
         var current: AccessibilityNodeInfo? = node
-        repeat(4) {
+        repeat(3) {
             val candidate = current ?: return false
-            if (candidate.isClickable && candidate.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            val bounds = Rect().also(candidate::getBoundsInScreen)
+            val windowRoot = candidate.window?.root
+            val rootBounds = Rect()
+            windowRoot?.getBoundsInScreen(rootBounds)
+
+            val compact = rootBounds.width() > 0 && rootBounds.height() > 0 &&
+                bounds.width() <= rootBounds.width() * 0.35f &&
+                bounds.height() <= rootBounds.height() * 0.22f
+
+            if (compact && candidate.isClickable &&
+                candidate.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            ) {
                 return true
             }
             current = candidate.parent

@@ -36,8 +36,10 @@ class ScreenBoardParser {
     ) {
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
-            .addOnSuccessListener { result -> onSuccess(parseResult(result, bitmap.width, bitmap.height)) }
-            .addOnFailureListener(onFailure)
+            .addOnSuccessListener { result ->
+                onSuccess(parseResult(result, bitmap.width, bitmap.height))
+            }
+            .addOnFailureListener { error -> onFailure(error) }
     }
 
     fun close() {
@@ -144,9 +146,7 @@ data class ScreenGameState(
         var hash = launcherValue
         columns.forEachIndexed { column, tiles ->
             hash = hash * 31 + column
-            tiles.forEach { tile ->
-                hash = hash * 31 + tile.value
-            }
+            tiles.forEach { tile -> hash = hash * 31 + tile.value }
         }
         return hash
     }
@@ -197,8 +197,6 @@ class ScreenDecisionEngine(private val parser: ScreenBoardParser) {
             confidence = if (best.second >= 2) 0.98f else 0.94f
             reason = "Shoot $launcher into column ${chosenColumn + 1}; merge chain depth ${best.second}"
         } else {
-            // No immediate merge: preserve headroom. Empty columns are preferred, otherwise use the
-            // shortest stack. This is safer than random placement near the descending danger line.
             chosenColumn = state.columns.indices.minWithOrNull(
                 compareBy<Int> { state.columns[it].size }
                     .thenBy { columnRisk(state.columns[it], launcher) }
@@ -209,10 +207,7 @@ class ScreenDecisionEngine(private val parser: ScreenBoardParser) {
         }
 
         val x = parser.columnCenterX(chosenColumn, state.screenWidth)
-        // Tap well inside the playfield and above the launcher. The game uses horizontal tap
-        // position to select the shooting column.
         val y = (state.screenHeight * 0.58f).toInt()
-
         return ScreenMove(chosenColumn, x, y, confidence, reason)
     }
 
@@ -231,7 +226,9 @@ class ScreenDecisionEngine(private val parser: ScreenBoardParser) {
     private fun columnRisk(stack: List<ScreenTile>, launcherValue: Int): Int {
         if (stack.isEmpty()) return 0
         val bottomValue = stack.last().value
-        // Prefer values numerically close to the incoming block after stack height has been tied.
-        return abs(Integer.numberOfTrailingZeros(bottomValue) - Integer.numberOfTrailingZeros(launcherValue))
+        return abs(
+            Integer.numberOfTrailingZeros(bottomValue) -
+                Integer.numberOfTrailingZeros(launcherValue)
+        )
     }
 }

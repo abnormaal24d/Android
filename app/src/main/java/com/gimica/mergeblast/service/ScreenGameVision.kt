@@ -1,7 +1,13 @@
 package com.gimica.mergeblast.service
 
+import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import com.gimica.mergeblast.config.DebugLogger
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -28,6 +34,26 @@ class ScreenBoardParser {
         private const val OCR_TOP_FRACTION = 0.19f
         private const val OCR_BOTTOM_FRACTION = 0.84f
         private const val MAX_TILE_VALUE = 1 shl 20
+
+        // This offerwall intercepts Android Back, so it needs a task-level escape rather than the
+        // normal ad closer. Header matching keeps this generic while the card labels make detection
+        // possible from the cropped low-latency OCR pass used during gameplay.
+        private val SURVEY_OFFERWALL_HEADERS = listOf(
+            "top surveys",
+            "available surveys",
+            "cash out",
+            "earned",
+            "live now"
+        )
+        private val SURVEY_OFFERWALL_CARDS = listOf(
+            "food choices",
+            "streaming habits",
+            "pets at home",
+            "fitness habits",
+            "music audio",
+            "music & audio",
+            "shopping habits"
+        )
     }
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -74,12 +100,22 @@ class ScreenBoardParser {
                 if (state != null) {
                     GameUiAutoNavigator.onBoardVisible()
                     AdAutoCloser.onGameVisible()
+                    SurveyOfferwallRecovery.onBoardVisible()
                     onSuccess(state)
                     return@addOnSuccessListener
                 }
 
                 val service = GameAccessibilityService.getInstance()
                 if (service == null) {
+                    onSuccess(null)
+                    return@addOnSuccessListener
+                }
+
+                // The survey wall shown by Merge Blast can consume Android Back indefinitely.
+                // Detect it before normal UI/ad handling and escape at task level. No survey card
+                // is ever clicked.
+                if (looksLikeSurveyOfferwall(result.text)) {
+                    SurveyOfferwallRecovery.recover(service)
                     onSuccess(null)
                     return@addOnSuccessListener
                 }
@@ -109,10 +145,16 @@ class ScreenBoardParser {
                 }
 
                 // Only if the cheap paths have no evidence, OCR the top+bottom ad control strips.
+                // This second pass includes the survey header/footer that the hot gameplay crop
+                // intentionally omits, giving us a second robust offerwall detection path.
                 adScreenDetector.inspect(
                     bitmap,
                     onSuccess = { adResult ->
-                        AdAutoCloser.handle(adResult, service)
+                        if (looksLikeSurveyOfferwall(adResult.recognizedText)) {
+                            SurveyOfferwallRecovery.recover(service)
+                        } else {
+                            AdAutoCloser.handle(adResult, service)
+                        }
                         onSuccess(null)
                     },
                     onFailure = {
@@ -129,6 +171,27 @@ class ScreenBoardParser {
     fun close() {
         recognizer.close()
         adScreenDetector.close()
+    }
+
+    private fun looksLikeSurveyOfferwall(rawText: String): Boolean {
+        if (rawText.isBlank()) return false
+        val normalized = rawText
+            .lowercase()
+            .replace('&', ' ')
+            .replace(Regex("[^a-z0-9$ ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        val headerHits = SURVEY_OFFERWALL_HEADERS.count { marker ->
+            normalized.contains(marker.replace('&', ' '))
+        }
+        val cardHits = SURVEY_OFFERWALL_CARDS.count { marker ->
+            normalized.contains(marker.replace('&', ' '))
+        }
+
+        return cardHits >= 3 ||
+            (headerHits >= 1 && cardHits >= 1) ||
+            (headerHits >= 2 && normalized.contains("survey"))
     }
 
     private fun parseResult(
@@ -236,6 +299,77 @@ class ScreenBoardParser {
     }
 
     private data class NumericElement(val value: Int, val bounds: Rect)
+}
+
+/**
+ * Escape hatch for the survey/offerwall activity that consumes Android Back.
+ *
+ * The first detection preserves as much task state as possible with CLEAR_TOP/SINGLE_TOP. If the
+ * same wall is still visible after the cooldown, a second detection performs a clean task relaunch.
+ * We deliberately go Home first so a WebView/activity that intercepts Back cannot keep focus.
+ */
+private object SurveyOfferwallRecovery {
+    private const val RECOVERY_COOLDOWN_MS = 900L
+    private const val RELAUNCH_DELAY_MS = 180L
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastRecoveryAt = 0L
+    private var consecutiveRecoveries = 0
+
+    @Synchronized
+    fun recover(service: GameAccessibilityService): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastRecoveryAt < RECOVERY_COOLDOWN_MS) return true
+
+        val targetPackage = service.getConfig().targetPackage
+        val launchIntent = service.packageManager.getLaunchIntentForPackage(targetPackage)
+        if (launchIntent == null) {
+            DebugLogger.w("Survey offerwall detected, but no launcher intent exists for $targetPackage")
+            return false
+        }
+
+        consecutiveRecoveries++
+        lastRecoveryAt = now
+        val hardReset = consecutiveRecoveries >= 2
+
+        launchIntent.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+        )
+        if (hardReset) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+
+        // HOME cannot be intercepted by the offerwall the way Back is. Relaunch Merge Blast shortly
+        // afterwards; CLEAR_TOP handles a separate offerwall Activity and CLEAR_TASK is the fallback
+        // for an embedded WebView/same-activity wall that survives the soft relaunch.
+        service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        handler.postDelayed(
+            {
+                try {
+                    service.startActivity(launchIntent)
+                    DebugLogger.w(
+                        if (hardReset) {
+                            "Survey offerwall persisted; performed clean Merge Blast task relaunch"
+                        } else {
+                            "Survey offerwall detected; relaunched Merge Blast with CLEAR_TOP"
+                        }
+                    )
+                } catch (t: Throwable) {
+                    DebugLogger.e("Failed to relaunch Merge Blast after survey offerwall", t)
+                }
+            },
+            RELAUNCH_DELAY_MS
+        )
+        return true
+    }
+
+    @Synchronized
+    fun onBoardVisible() {
+        consecutiveRecoveries = 0
+        lastRecoveryAt = 0L
+    }
 }
 
 data class ScreenTile(

@@ -24,6 +24,8 @@ class ScreenBoardParser {
         private const val LAUNCHER_BOTTOM_FRACTION = 0.86f
         private const val LAUNCHER_CENTER_TOLERANCE = 0.20f
         private const val BOARD_LAUNCHER_GAP_FRACTION = 0.07f
+        private const val OCR_TOP_FRACTION = 0.18f
+        private const val OCR_BOTTOM_FRACTION = 0.88f
         private const val MAX_TILE_VALUE = 1 shl 20
     }
 
@@ -34,25 +36,48 @@ class ScreenBoardParser {
         onSuccess: (ScreenGameState?) -> Unit,
         onFailure: (Exception) -> Unit
     ) {
-        val input = InputImage.fromBitmap(bitmap, 0)
+        if (bitmap.width <= 0 || bitmap.height <= 0) {
+            onSuccess(null)
+            return
+        }
+
+        // OCR only the gameplay band. The score header and bottom advertisement contain lots of
+        // unrelated text and make full-screen recognition substantially slower.
+        val cropTop = (bitmap.height * OCR_TOP_FRACTION).toInt().coerceIn(0, bitmap.height - 1)
+        val cropBottom = (bitmap.height * OCR_BOTTOM_FRACTION).toInt().coerceIn(cropTop + 1, bitmap.height)
+        val cropped = try {
+            Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, cropBottom - cropTop)
+        } catch (error: Exception) {
+            onFailure(error)
+            return
+        }
+
+        val input = InputImage.fromBitmap(cropped, 0)
         recognizer.process(input)
             .addOnSuccessListener { result ->
-                onSuccess(parseResult(result, bitmap.width, bitmap.height))
+                try {
+                    onSuccess(parseResult(result, bitmap.width, bitmap.height, cropTop))
+                } finally {
+                    if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                }
             }
-            .addOnFailureListener { error -> onFailure(error) }
+            .addOnFailureListener { error ->
+                if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                onFailure(error)
+            }
     }
 
     fun close() {
         recognizer.close()
     }
 
-    private fun parseResult(result: Text, width: Int, height: Int): ScreenGameState? {
+    private fun parseResult(result: Text, width: Int, height: Int, yOffset: Int): ScreenGameState? {
         if (width <= 0 || height <= 0 || width >= height) return null
 
         val numbers = result.textBlocks
             .flatMap { it.lines }
             .flatMap { it.elements }
-            .mapNotNull(::parseNumericElement)
+            .mapNotNull { parseNumericElement(it, yOffset) }
             .filter { isTileValue(it.value) }
 
         if (numbers.isEmpty()) return null
@@ -99,8 +124,9 @@ class ScreenBoardParser {
         )
     }
 
-    private fun parseNumericElement(element: Text.Element): NumericElement? {
-        val bounds = element.boundingBox ?: return null
+    private fun parseNumericElement(element: Text.Element, yOffset: Int): NumericElement? {
+        val sourceBounds = element.boundingBox ?: return null
+        val bounds = Rect(sourceBounds).apply { offset(0, yOffset) }
         val cleaned = element.text
             .trim()
             .replace(" ", "")
@@ -109,7 +135,7 @@ class ScreenBoardParser {
 
         if (!cleaned.matches(Regex("\\d{1,7}"))) return null
         val value = cleaned.toIntOrNull() ?: return null
-        return NumericElement(value, Rect(bounds))
+        return NumericElement(value, bounds)
     }
 
     private fun isTileValue(value: Int): Boolean =

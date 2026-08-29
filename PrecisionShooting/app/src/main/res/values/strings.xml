@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">Precision Shooting</string>
+    <string name="game_screen_title">Precision Shooting</string>
+    <string name="back">Back</string>
+    <string name="score">SCORE</string>
+    <string name="best_score_short">BEST: %1$d</string>
+    <string name="time">TIME</string>
+    <string name="countdown_3">3</string>
+    <string name="countdown_2">2</string>
+    <string name="countdown_1">1</string>
+    <string name="game_over">GAME OVER</string>
+    <string name="final_score">FINAL SCORE</string>
+    <string name="best_score">BEST SCORE</string>
+    <string name="hits">HITS</string>
+    <string name="shot_accuracy">SHOT ACCURACY</string>
+    <string name="play_again">PLAY AGAIN</string>
+    <string name="back_to_menu">BACK TO MENU</string>
+    <string name="start_game">START GAME</string>
+    <string name="settings">SETTINGS</string>
+    <string name="exit">EXIT</string>
+    <string name="version_name">VERSION 1.2</string>
+    <string name="brand_shooting">SHOOTING</string>
+    <string name="brand_game">GAME</string>
+    <string name="brand_tagline">TACTICAL COMBAT</string>
+    <string name="settings_coming_soon">Settings coming soon</string>
+</resources>
